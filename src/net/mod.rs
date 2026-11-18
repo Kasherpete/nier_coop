@@ -101,6 +101,8 @@ fn run(cfg: &Config) -> std::io::Result<()> {
     tracing::info!("udp bound to {}, peer {}", cfg.bind, cfg.peer);
 
     let mirror = cfg.peer == cfg.bind;
+    // The peer's IP is trusted, its port is learned: a home router may change it (no port forward needed then).
+    let mut peer = cfg.peer;
     let (mut tx_seq, mut rx_seq) = (0u32, None::<u32>);
     let mut last_rx = None::<Instant>;
     let (mut sent_frame, mut sent_at) = (0u32, Instant::now());
@@ -122,7 +124,7 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 | (HOST.load(Ordering::Relaxed) as u32 * IS_HOST)
                 | (corr.is_some() as u32 * HAS_CORRECTION);
             let h = Header { seq: tx_seq, epoch: LOCAL_EPOCH.load(Ordering::Relaxed), flags };
-            sock.send_to(&encode(h, &corr.unwrap_or_default(), &frames), cfg.peer)?;
+            sock.send_to(&encode(h, &corr.unwrap_or_default(), &frames), peer)?;
             if cfg.world_sync {
                 // Same pace as the inputs: the host's newest snapshot, or the client's damage totals.
                 let p = if cfg.host {
@@ -130,12 +132,16 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 } else {
                     encode_list(DAMAGE_MAGIC, tx_seq, &state::lock(&LOCAL_DAMAGE))
                 };
-                sock.send_to(&p, cfg.peer)?;
+                sock.send_to(&p, peer)?;
             }
         }
         match sock.recv_from(&mut buf) {
-            // Only the configured peer is trusted; anything else is dropped.
-            Ok((n, from)) if from == cfg.peer => {
+            // Only the configured peer's IP is trusted; anything else is dropped.
+            Ok((n, from)) if from.ip() == cfg.peer.ip() => {
+                if from != peer {
+                    tracing::info!("peer answers from {from}");
+                    peer = from;
+                }
                 if let Some((seq, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {
                     let fresh = world_rx_seq.is_none_or(|r: u32| (seq.wrapping_sub(r) as i32) > 0);
                     if !cfg.host && fresh && s.iter().all(|e| sane(&[e.yaw, e.pos.x, e.pos.y, e.pos.z, e.pos.w])) {

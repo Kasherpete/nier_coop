@@ -42,6 +42,8 @@ const _: () = assert!(size_of::<Correction>() == 0x40);
 pub const REDUNDANCY: usize = 8;
 /// Remote frames buffered beyond this are merged into the next one so the copy catches up (~4 frames of jitter).
 const MAX_BUFFERED: usize = 4;
+/// Hard limit on queued remote frames (~2 s at 60 fps).
+const MAX_QUEUED: usize = 128;
 
 /// Remote inputs in frame order: the network thread pushes, the game thread takes one per tick.
 #[derive(Default)]
@@ -64,6 +66,10 @@ impl InputQueue {
                 self.last = Some(f.frame);
                 self.q.push_back(f);
             }
+        }
+        // Hard cap while nothing pops (loading, paused game, flooding peer): stale inputs are dropped.
+        while self.q.len() > MAX_QUEUED {
+            self.q.pop_front();
         }
     }
 
@@ -185,6 +191,11 @@ mod tests {
         w.push(&[f(u32::MAX, 0)]);
         w.push(&[f(1, 0)]);
         assert_eq!(w.q.len(), 2);
+
+        // Nothing popping: capped, newest kept.
+        let mut c = InputQueue::new();
+        c.push(&(1..=300).map(|i| f(i, 0)).collect::<Vec<_>>());
+        assert_eq!((c.q.len(), c.q.back().unwrap().frame), (MAX_QUEUED, 300));
     }
 
     #[test]

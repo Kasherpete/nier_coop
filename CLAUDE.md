@@ -23,7 +23,11 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 Requires nightly Rust (pinned in `rust-toolchain.toml`) because retour's `static-detour` uses unstable features. If the project path is deep, `link.exe` fails with LNK1104 (paths over 260 chars): set `CARGO_TARGET_DIR` to a short folder.
 
-Output: `target/x86_64-pc-windows-msvc/release/nier_coop.dll`. Load it with an injector or a proxy DLL. On load, a debug console opens and `tracing` logs go to stdout.
+Output: `target/x86_64-pc-windows-msvc/release/nier_coop.dll`. It exports `DirectInput8Create` (forwarded to the
+System32 dinput8.dll by full path), so renamed to `dinput8.dll` in the game folder it loads at startup; an injector
+also works, and a named mutex keeps a second copy from running. `package/build.ps1` makes `dist/nier_coop.zip`
+(the DLL as dinput8.dll, `Install.bat`/`install.ps1` that finds the Steam folder and writes the cfg, `Uninstall.bat`).
+The net thread trusts the peer's IP and learns its port from what arrives, so port-changing routers still connect. On load, a debug console opens and `tracing` logs go to stdout.
 
 ## Folder structure
 

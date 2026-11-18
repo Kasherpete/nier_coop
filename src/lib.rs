@@ -33,7 +33,32 @@ extern "system" fn DllMain(module: HMODULE, reason: u32, reserved: *mut c_void) 
     TRUE
 }
 
+/// Proxy entry: shipped as `dinput8.dll` in the game folder, the game loads this DLL at startup (no injector).
+/// Forwards to the real System32 dinput8.dll, loaded on first call (never inside DllMain).
+#[unsafe(no_mangle)]
+extern "system" fn DirectInput8Create(inst: HMODULE, ver: u32, riid: *const c_void, out: *mut *mut c_void, outer: *mut c_void) -> i32 {
+    type F = extern "system" fn(HMODULE, u32, *const c_void, *mut *mut c_void, *mut c_void) -> i32;
+    static REAL: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let real = REAL.get_or_init(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        // Full path: by bare name the loader returns this DLL (already loaded as "dinput8.dll") and we call ourselves.
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let h = LoadLibraryW(&windows::core::HSTRING::from(format!(r"{root}\System32\dinput8.dll"))).ok()?;
+        GetProcAddress(h, windows::core::s!("DirectInput8Create")).map(|f| f as usize)
+    });
+    match real {
+        Some(f) => unsafe { std::mem::transmute::<usize, F>(*f)(inst, ver, riid, out, outer) },
+        None => 0x8000_4005u32 as i32, // E_FAIL
+    }
+}
+
 fn worker() {
+    // Loaded twice (dinput8.dll proxy plus an injector)? Only the first copy runs, two would hook everything twice.
+    let name = windows::core::HSTRING::from(format!("nier_coop_{}", std::process::id()));
+    match unsafe { windows::Win32::System::Threading::CreateMutexW(None, true, &name) } {
+        Ok(_) if unsafe { windows::Win32::Foundation::GetLastError() } != windows::Win32::Foundation::ERROR_ALREADY_EXISTS => {}
+        _ => return,
+    }
     unsafe {
         let _ = AllocConsole();
     }

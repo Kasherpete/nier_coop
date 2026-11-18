@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use super::{PL_VTABLE, entity_by_handle, for_each_object};
+use super::{PL_VTABLE, entity_by_handle, for_each_object, in_module};
 use crate::sdk::{Pl0000, cVec4};
 use crate::state::{
     self, Damage, EnemyState, HOST, LOCAL_DAMAGE, LOCAL_WORLD, MAX_ENEMIES, REMOTE_ACTIVE, REMOTE_CORRECTION, REMOTE_DAMAGE,
@@ -49,7 +49,10 @@ fn enemy(handle: u32, kind: Option<u32>) -> Option<(*mut Pl0000, u32)> {
     let b = unsafe { addr_of_mut!((*e).behavior).read() };
     let vt = unsafe { b.as_ref()? }.vtable as usize;
     let k = name_hash(&name);
-    (name.starts_with(b"em") && vt != PL_VTABLE.load(Relaxed) && kind.is_none_or(|x| x == k)).then_some((b, k))
+    let pl = PL_VTABLE.load(Relaxed);
+    // shortcut: a game vtable + "em" name is the type check; an allowlist of enemy vtables would be stricter, add one if a non-Behavior "em*" object shows up.
+    let ok = pl != 0 && vt != pl && in_module(vt) && name.starts_with(b"em");
+    (ok && kind.is_none_or(|x| x == k)).then_some((b, k))
 }
 
 fn name_hash(name: &[u8]) -> u32 {

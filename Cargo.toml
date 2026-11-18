@@ -1,6 +1,6 @@
 [package]
 name = "nier_coop"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 
 [lib]
@@ -16,6 +16,7 @@ tracing-subscriber = "0.3"
 version = "0.58"
 features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",

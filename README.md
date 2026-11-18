@@ -19,8 +19,12 @@ for details.
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
-Copy `nier_coop.cfg.example` to `nier_coop.cfg` next to `NieRAutomata.exe`, set `bind` and `peer`, then inject
-`nier_coop.dll` into the running game.
+To make the zip for players, run `package\build.ps1`, which writes `dist\nier_coop.zip`. Each player unzips it
+and runs `Install.bat`, which copies the DLL into the game folder as `dinput8.dll` (the game loads it at startup, no
+injector) and writes `nier_coop.cfg`. Steps are in `package\README.txt`.
+
+Manual install: copy `nier_coop.cfg.example` to `nier_coop.cfg` next to `NieRAutomata.exe`, set `bind` and `peer`,
+then put `nier_coop.dll` there as `dinput8.dll`, or inject it into the running game.
 
 ## Contributing
 

@@ -1,21 +1,27 @@
 //! Per-frame game update hook (read local player / drive the remote one), a `start_animation` detour
 //! (record local animations) and a mid-function hook that forces the remote's held buttons.
 //! The remote player is the local player's buddy: a spawned 2B when `spawn_2b=true`, else the
-//! game's own buddy. It is driven like AutomataMP does: controller inputs (stick speed and
-//! direction, held/pressed buttons) so the engine plays its own locomotion and attacks.
-//! Everything here runs on the game thread; it only touches `state` slots, never the network.
+//! game's own buddy. It is driven by the peer's controller input, one frame of input per game
+//! frame (stick speed and direction, held/pressed buttons, pod aim), so the engine plays its own
+//! locomotion and attacks; the peer's real position only corrects drift.
+//! Everything here runs on the game thread; it only touches `state`, never the network.
 
 use std::ptr::addr_of_mut;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 use retour::{RawDetour, static_detour};
 
 use crate::scan;
 use crate::sdk::{self, Entity, EntityDescriptor, Pl0000, cVec4, patterns};
-use crate::state::{LOCAL, PlayerState, REMOTE, REMOTE_ACTIVE};
+use crate::state::{
+    self, Correction, InputFrame, LOCAL_CORRECTION, LOCAL_INPUTS, LOCAL_READY, LOCKSTEP, REDUNDANCY, REMOTE_ACTIVE,
+    REMOTE_CORRECTION, REMOTE_INPUTS,
+};
 
+mod lockstep;
 mod spawn;
+mod world;
 
 static_detour! {
     static StartAnim: unsafe extern "system" fn(*mut Pl0000, u32, u32, u32, u32);
@@ -33,9 +39,12 @@ static BUDDY: AtomicUsize = AtomicUsize::new(0);
 /// Local player's last start_animation args + counter (game thread only).
 static ANIM: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
 static APPLIED_ANIM_SEQ: AtomicU32 = AtomicU32::new(0);
-/// Local player's last non-zero `buttons` + counter, so a press survives until the next send.
-static BTN: [AtomicU32; 9] = [const { AtomicU32::new(0) }; 9];
-static APPLIED_BTN_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Set from `nier_coop.cfg`: replay the peer's animations on top of the inputs.
+pub static ANIM_REPLAY: AtomicBool = AtomicBool::new(false);
+/// Local tick counter stamped on each sent input frame (never 0, which marks an empty packet slot).
+static FRAME: AtomicU32 = AtomicU32::new(0);
+/// The remote input applied this tick; read again by the held and free-aim hooks later in the frame.
+static APPLIED: Mutex<InputFrame> = Mutex::new(InputFrame { frame: 0, speed: 0.0, facing2: 0.0, held: 0, buttons: [0; 8], aim: cVec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 }, checksum: 0, _pad: 0 });
 /// held_flags the mid-hook writes into the remote's controller.
 static REMOTE_HELD: AtomicU32 = AtomicU32::new(0);
 static HELD_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `held_thunk`'s jmp
@@ -185,14 +194,13 @@ extern "system" fn on_free_aim(pl: usize, out: *mut cVec4) -> usize {
     if b == 0 || pl != b || out.is_null() || !REMOTE_ACTIVE.load(Relaxed) {
         return 0;
     }
-    match REMOTE.load() {
-        // `out` is pod_shot's own stack slot for the aim vector (see POD_NO_TARGET).
-        Some(s) if s.held & sdk::HELD_POD_FIRE != 0 => {
-            unsafe { out.write_unaligned(s.aim) };
-            1
-        }
-        _ => 0,
+    let f = *state::lock(&APPLIED);
+    if f.held & sdk::HELD_POD_FIRE == 0 {
+        return 0;
     }
+    // `out` is pod_shot's own stack slot for the aim vector (see POD_NO_TARGET).
+    unsafe { out.write_unaligned(f.aim) };
+    1
 }
 
 /// Mid-function hook at `held_store`: saves every volatile register and flags, calls `on_held(rcx)`,
@@ -322,10 +330,12 @@ extern "system" fn on_tick() {
     // happens on the peer's machine) and showing the peer's health, also while the local player is in a flight unit.
     if let Some(b) = spawned {
         unsafe { addr_of_mut!((*b).muteki_timer).write(300.0) }; // the value Pl0000.setEventMuteki uses
-        if let Some(s) = REMOTE.load() {
-            unsafe { addr_of_mut!((*b).health).write(s.hp.max(1)) };
+        if let Some(c) = *state::lock(&REMOTE_CORRECTION) {
+            unsafe { addr_of_mut!((*b).health).write(c.hp.max(1)) };
         }
     }
+    LOCAL_READY.store(pl.is_some(), Relaxed);
+    let ls_frame = if LOCKSTEP.load(Relaxed) { lockstep::step_clock(pl.is_some()) } else { None };
     let Some(pl) = pl else {
         BUDDY.store(0, Relaxed);
         return;
@@ -343,35 +353,72 @@ extern "system" fn on_tick() {
     }
     let buddy = unsafe { entity_by_handle(addr_of_mut!((*pl).buddy_handle).read()) }.and_then(as_pl0000);
     BUDDY.store(buddy.map_or(0, |b| b as usize), Relaxed);
+    world::tick(pl);
 
+    // Record this frame's input (sent every frame) and current state (for drift correction).
+    // In lockstep the frame number is the shared lockstep frame and carries a world checksum.
     let anim: [u32; 5] = std::array::from_fn(|i| ANIM[i].load(Relaxed));
-    unsafe {
-        let buttons = addr_of_mut!((*pl).buttons).read();
-        if buttons.iter().any(|&b| b != 0) {
-            for (a, v) in BTN.iter().zip(buttons) {
-                a.store(v, Relaxed);
-            }
-            BTN[8].fetch_add(1, Relaxed);
+    let (frame, checksum) = match ls_frame {
+        Some(n) => (n, lockstep::world_checksum(pl, buddy)),
+        None if LOCKSTEP.load(Relaxed) => (0, 0), // lockstep on but not running: send nothing but heartbeats
+        None => {
+            let n = match FRAME.load(Relaxed).wrapping_add(1) {
+                0 => 1,
+                n => n,
+            };
+            FRAME.store(n, Relaxed);
+            (n, 0)
         }
-        LOCAL.store(&PlayerState {
+    };
+    unsafe {
+        let input = InputFrame {
+            frame,
+            speed: addr_of_mut!((*pl).speed).read(),
+            facing2: addr_of_mut!((*pl).facing2).read(),
+            held: addr_of_mut!((*pl).held_flags).read(),
+            buttons: addr_of_mut!((*pl).buttons).read(),
+            aim: addr_of_mut!((*pl).pod_aim).read(),
+            checksum,
+            _pad: 0,
+        };
+        if frame != 0 {
+            let mut local = state::lock(&LOCAL_INPUTS);
+            if local.len() == REDUNDANCY {
+                local.pop_front();
+            }
+            local.push_back(input);
+        }
+        *state::lock(&LOCAL_CORRECTION) = Some(Correction {
             pos: addr_of_mut!((*pl).position).read(),
             rot: addr_of_mut!((*pl).rotation).read(),
-            facing2: addr_of_mut!((*pl).facing2).read(),
             hp: addr_of_mut!((*pl).health).read(),
+            pod_cooldown: pod_cooldown_slot(pl).map_or(0.0, |c| c.read()),
             anim: [anim[0], anim[1], anim[2], anim[3]],
             anim_seq: anim[4],
-            speed: addr_of_mut!((*pl).speed).read(),
-            held: addr_of_mut!((*pl).held_flags).read(),
-            buttons: std::array::from_fn(|i| BTN[i].load(Relaxed)),
-            btn_seq: BTN[8].load(Relaxed),
-            aim: addr_of_mut!((*pl).pod_aim).read(),
-            pod_cooldown: pod_cooldown_slot(pl).map_or(0.0, |c| c.read()),
+            _pad: 0,
         });
     }
+    // Lockstep: wait for the peer's input of frame N - delay (ours for N is already queued for sending).
+    let remote = match ls_frame {
+        Some(n) => Some(lockstep::barrier(n, checksum)),
+        None if LOCKSTEP.load(Relaxed) => return, // stopped (waiting for the peer): nothing to apply
+        None => None,
+    };
     if let (Some(b), true) = (buddy, REMOTE_ACTIVE.load(Relaxed)) {
-        if let Some(s) = REMOTE.load() {
-            apply_state(b, &s);
-            run_pod_program(b, s.pod_cooldown);
+        // One remote frame per local frame; with none buffered, keep the stick and held buttons but press nothing new.
+        let next = match remote {
+            Some(r) => r,
+            None => state::lock(&REMOTE_INPUTS).pop(),
+        };
+        let input = {
+            let mut applied = state::lock(&APPLIED);
+            *applied = next.unwrap_or(InputFrame { buttons: [0; 8], ..*applied });
+            *applied
+        };
+        apply_input(b, &input);
+        if let Some(c) = *state::lock(&REMOTE_CORRECTION) {
+            correct_drift(b, &c);
+            run_pod_program(b, c.pod_cooldown);
         }
     }
 }
@@ -438,16 +485,27 @@ const AIM_RADIUS: f32 = 4.0;
 /// Handle of the entity whose position is closest to `aim` (within `AIM_RADIUS`), skipping `skip`.
 /// None means free aim: `on_free_aim` then shoots at the aim point itself.
 fn nearest_entity(aim: cVec4, skip: *mut Pl0000) -> Option<u32> {
+    let mut best = (AIM_RADIUS * AIM_RADIUS, None);
+    for_each_object(|handle, b, p| {
+        let dd = (p.x - aim.x).powi(2) + (p.y - aim.y).powi(2) + (p.z - aim.z).powi(2);
+        if b != skip && dd < best.0 {
+            best = (dd, Some(handle));
+        }
+    });
+    best.1
+}
+
+/// Calls `f(handle, behavior, position)` for every live game object in the entity list, in list order.
+fn for_each_object(mut f: impl FnMut(u32, *mut Pl0000, cVec4)) {
     let g = ENTITY_LIST.load(Relaxed);
     if g == 0 {
-        return None;
+        return;
     }
-    let mut best = (AIM_RADIUS * AIM_RADIUS, None);
     unsafe {
         let list = (g as *const *const EntityDescriptor).read_volatile();
         let count = ((g - sdk::ENTITY_COUNT_BEFORE_LIST) as *const u32).read_volatile() as usize;
         if list.is_null() {
-            return None;
+            return;
         }
         for i in 0..count {
             let d = list.add(i).read_volatile();
@@ -455,17 +513,12 @@ fn nearest_entity(aim: cVec4, skip: *mut Pl0000) -> Option<u32> {
             let b = e.behavior;
             // Only real game objects: every list behavior with a game vtable is a Behavior, which is larger than
             // Model::position (0x50..0x60). pod_shot itself rejects non-model targets (0x385f10 returns null).
-            if b.is_null() || b == skip || !in_module(b.as_ref().map_or(0, |o| o.vtable as usize)) {
+            if b.is_null() || !in_module(b.as_ref().map_or(0, |o| o.vtable as usize)) {
                 continue;
             }
-            let p = addr_of_mut!((*b).position).read();
-            let dd = (p.x - aim.x).powi(2) + (p.y - aim.y).powi(2) + (p.z - aim.z).powi(2);
-            if dd < best.0 {
-                best = (dd, Some(e.handle));
-            }
+            f(e.handle, b, addr_of_mut!((*b).position).read());
         }
     }
-    best.1
 }
 
 /// The entity's behavior, only if its vtable is the `Pl0000` one (so the struct size is known).
@@ -528,41 +581,75 @@ fn start_animation(this: *mut Pl0000, anim: u32, variant: u32, a3: u32, a4: u32)
     unsafe { StartAnim.call(this, anim, variant, a3, a4) }
 }
 
-fn apply_state(b: *mut Pl0000, s: &PlayerState) {
+/// Feeds one frame of the peer's controller input to her controller; the engine does the rest.
+fn apply_input(b: *mut Pl0000, f: &InputFrame) {
     unsafe {
-        // Smooth network jitter by moving halfway each tick.
-        let pos = addr_of_mut!((*b).position);
-        let (c, t) = (pos.read(), s.pos);
-        pos.write(cVec4 { x: c.x + (t.x - c.x) * 0.5, y: c.y + (t.y - c.y) * 0.5, z: c.z + (t.z - c.z) * 0.5, w: t.w });
-        // shortcut: rotation snaps (no yaw-wrap interpolation); fine at 60 Hz, interpolate if turning looks jerky.
-        addr_of_mut!((*b).rotation).write(s.rot);
-        addr_of_mut!((*b).facing2).write(s.facing2);
-        // Controller inputs: the engine turns these into walk/run/stop and attacks on its own.
         addr_of_mut!((*b).run_speed_type).write(0); // speed from the controller, not buddy AI
-        addr_of_mut!((*b).speed).write(s.speed);
-        let mut held = s.held;
-        if s.btn_seq != APPLIED_BTN_SEQ.swap(s.btn_seq, Relaxed) {
-            addr_of_mut!((*b).buttons).write(s.buttons);
-            held |= s.buttons.iter().enumerate().filter(|(_, v)| **v != 0).fold(0, |h, (i, _)| h | 1 << i);
+        addr_of_mut!((*b).speed).write(f.speed);
+        addr_of_mut!((*b).facing2).write(f.facing2);
+        addr_of_mut!((*b).buttons).write(f.buttons);
+    }
+    let held = f.held | f.buttons.iter().enumerate().filter(|(_, v)| **v != 0).fold(0, |h, (i, _)| h | 1 << i);
+    REMOTE_HELD.store(held, Relaxed);
+    set_held(b, held); // also forced in `on_held` when that hook is installed
+    if held & sdk::HELD_POD_FIRE != 0 {
+        // Her pod aims at a target entity, not a camera ray: use what sits at the remote player's aim point.
+        unsafe { addr_of_mut!((*b).pod_target).write(nearest_entity(f.aim, b).unwrap_or(0)) };
+    }
+}
+
+/// Past this distance (m) the inputs have drifted: pull her toward the peer's real position.
+const CORRECT_DIST: f32 = 1.0;
+/// Past this distance (m) she is teleported (area load, respawn, long stall).
+const SNAP_DIST: f32 = 10.0;
+/// Past this yaw error (rad) her rotation is set to the peer's.
+const CORRECT_YAW: f32 = 0.5;
+
+/// Drift correction only: small errors are left to the inputs, so her motion stays the engine's own.
+fn correct_drift(b: *mut Pl0000, c: &Correction) {
+    unsafe {
+        let pos = addr_of_mut!((*b).position);
+        let (p, t) = (pos.read(), c.pos);
+        let d = ((t.x - p.x).powi(2) + (t.y - p.y).powi(2) + (t.z - p.z).powi(2)).sqrt();
+        if d > SNAP_DIST {
+            pos.write(t);
+        } else if d > CORRECT_DIST {
+            let k = 0.2;
+            pos.write(cVec4 { x: p.x + (t.x - p.x) * k, y: p.y + (t.y - p.y) * k, z: p.z + (t.z - p.z) * k, w: t.w });
         }
-        REMOTE_HELD.store(held, Relaxed);
-        set_held(b, held); // also forced in `on_held` when that hook is installed
-        if held & sdk::HELD_POD_FIRE != 0 {
-            // Her pod aims at a target entity, not a camera ray: use what sits at the remote player's aim point.
-            addr_of_mut!((*b).pod_target).write(nearest_entity(s.aim, b).unwrap_or(0));
+        let rot = addr_of_mut!((*b).rotation);
+        if yaw_error(rot.read().y, c.rot.y) > CORRECT_YAW {
+            rot.write(c.rot);
         }
-        let [a, ..] = s.anim;
+        if !ANIM_REPLAY.load(Relaxed) {
+            return;
+        }
+        let [a, ..] = c.anim;
         let replay = !sdk::ANIM_CRASHES.contains(&a) && !sdk::ANIM_FROM_INPUT.contains(&a);
-        if s.anim_seq != APPLIED_ANIM_SEQ.swap(s.anim_seq, Relaxed) && replay && StartAnim.is_enabled() {
-            let [a, v, a3, a4] = s.anim;
+        if c.anim_seq != APPLIED_ANIM_SEQ.swap(c.anim_seq, Relaxed) && replay && StartAnim.is_enabled() {
+            let [a, v, a3, a4] = c.anim;
             tracing::debug!("anim replay on buddy: {a:#x} {v:#x} {a3:#x} {a4:#x}");
             StartAnim.call(b, a, v, a3, a4); // original, bypassing the buddy filter
         }
     }
 }
 
+/// Absolute difference of two yaw angles (rad), wrapped to [0, pi].
+fn yaw_error(a: f32, b: f32) -> f32 {
+    let d = (a - b).rem_euclid(std::f32::consts::TAU);
+    d.min(std::f32::consts::TAU - d)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn yaw_error_wraps() {
+        use std::f32::consts::PI;
+        assert!((super::yaw_error(PI - 0.1, -PI + 0.1) - 0.2).abs() < 1e-5);
+        assert!((super::yaw_error(0.0, PI) - PI).abs() < 1e-5);
+        assert!(super::yaw_error(1.0, 1.0 + 2.0 * PI) < 1e-5);
+    }
+
     /// Maps a PE file's sections to their virtual offsets, like the loader does (no relocations or imports).
     pub fn map_image(f: &[u8]) -> Vec<u8> {
         let rd = |o: usize, n: usize| f.get(o..o + n).map(|b| b.iter().rev().fold(0usize, |a, &x| a << 8 | x as usize)).unwrap();

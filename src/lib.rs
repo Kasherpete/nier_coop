@@ -48,6 +48,10 @@ fn worker() {
     }
     tracing::info!("nier_coop loaded");
     hooks::SPAWN_2B.store(cfg.as_ref().is_some_and(|c| c.spawn_2b), std::sync::atomic::Ordering::Relaxed);
+    hooks::ANIM_REPLAY.store(cfg.as_ref().is_some_and(|c| c.anim_replay), std::sync::atomic::Ordering::Relaxed);
+    state::LOCKSTEP.store(cfg.as_ref().is_some_and(|c| c.lockstep), std::sync::atomic::Ordering::Relaxed);
+    state::WORLD_SYNC.store(cfg.as_ref().is_some_and(|c| c.world_sync), std::sync::atomic::Ordering::Relaxed);
+    state::HOST.store(cfg.as_ref().is_some_and(|c| c.host), std::sync::atomic::Ordering::Relaxed);
 
     if let Err(e) = hooks::install() {
         tracing::error!("hooks not installed: {e}");

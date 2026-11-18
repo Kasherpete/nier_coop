@@ -1,0 +1,615 @@
+//! Per-frame game update hook (read local player / drive the remote one), a `start_animation` detour
+//! (record local animations) and a mid-function hook that forces the remote's held buttons.
+//! The remote player is the local player's buddy: a spawned 2B when `spawn_2b=true`, else the
+//! game's own buddy. It is driven like AutomataMP does: controller inputs (stick speed and
+//! direction, held/pressed buttons) so the engine plays its own locomotion and attacks.
+//! Everything here runs on the game thread; it only touches `state` slots, never the network.
+
+use std::ptr::addr_of_mut;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+
+use retour::{RawDetour, static_detour};
+
+use crate::scan;
+use crate::sdk::{self, Entity, EntityDescriptor, Pl0000, cVec4, patterns};
+use crate::state::{LOCAL, PlayerState, REMOTE, REMOTE_ACTIVE};
+
+mod spawn;
+
+static_detour! {
+    static StartAnim: unsafe extern "system" fn(*mut Pl0000, u32, u32, u32, u32);
+}
+
+static MODULE: OnceLock<&'static [u8]> = OnceLock::new();
+/// Absolute addresses resolved at install.
+static ENTITY_LIST: AtomicUsize = AtomicUsize::new(0); // global `EntityDescriptor*`
+static POSSESSED: AtomicUsize = AtomicUsize::new(0); // global u32 handle of the controlled entity
+static TICK_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `tick_thunk`'s jmp
+/// Learned on the first tick: the `Pl0000` vtable, and this frame's player / buddy behaviors.
+static PL_VTABLE: AtomicUsize = AtomicUsize::new(0);
+static PLAYER: AtomicUsize = AtomicUsize::new(0);
+static BUDDY: AtomicUsize = AtomicUsize::new(0);
+/// Local player's last start_animation args + counter (game thread only).
+static ANIM: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+static APPLIED_ANIM_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Local player's last non-zero `buttons` + counter, so a press survives until the 30 Hz send.
+static BTN: [AtomicU32; 9] = [const { AtomicU32::new(0) }; 9];
+static APPLIED_BTN_SEQ: AtomicU32 = AtomicU32::new(0);
+/// held_flags the mid-hook writes into the remote's controller.
+static REMOTE_HELD: AtomicU32 = AtomicU32::new(0);
+static HELD_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `held_thunk`'s jmp
+static FREE_AIM_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `free_aim_thunk`'s jmps
+static FREE_AIM_RESUME: AtomicUsize = AtomicUsize::new(0);
+/// Set from `nier_coop.cfg` before `install`.
+pub static SPAWN_2B: AtomicBool = AtomicBool::new(false);
+/// Handle of the spawned 2B (0 = none yet); she is spawned again once the game removes her (restart, area load).
+static SPAWNED: AtomicU32 = AtomicU32::new(0);
+/// Ticks until the next spawn attempt, so a failing spawn is not retried every frame.
+static SPAWN_WAIT: AtomicU32 = AtomicU32::new(0);
+
+pub fn install() -> Result<(), String> {
+    let m = scan::module().ok_or("could not read game module")?;
+    let _ = MODULE.set(m);
+    let base = m.as_ptr() as usize;
+    let (list, possessed, update) = resolve(m)?;
+
+    ENTITY_LIST.store(base + list, Relaxed);
+    POSSESSED.store(base + possessed, Relaxed);
+    // shortcut: patches code while game threads run (retour does not suspend them); fine at startup, not mid-combat.
+    unsafe {
+        let d = RawDetour::new((base + update) as *const (), tick_thunk as *const ()).map_err(|e| format!("UPDATE detour: {e}"))?;
+        TICK_TRAMPOLINE.store(d.trampoline() as *const () as usize, Relaxed);
+        d.enable().map_err(|e| format!("UPDATE detour: {e}"))?;
+        Box::leak(Box::new(d)); // never unhooked; see DllMain
+    }
+    tracing::info!("hooks installed: update={:#x} entity_list={:#x} possessed={:#x}", base + update, base + list, base + possessed);
+
+    // Optional parts: without them the remote still moves, but cannot be a 2B / hold buttons.
+    match spawn::resolve(m) {
+        Ok(o) => {
+            let o = spawn::Offsets { spawn: base + o.spawn, spawner: base + o.spawner, routine: base + o.routine, scripts: base + o.scripts, held_store: base + o.held_store };
+            tracing::info!("{o:x?}");
+            // shortcut: mid-function detour; assumes no jump lands inside the overwritten instructions (true for the
+            // checked exe: a 7-byte mov then `mov rbx,rcx`). Re-check `held_store` bytes after a game update.
+            match unsafe { RawDetour::new(o.held_store as *const (), held_thunk as *const ()) } {
+                Ok(d) => {
+                    HELD_TRAMPOLINE.store(d.trampoline() as *const () as usize, Relaxed);
+                    match unsafe { d.enable() } {
+                        Ok(()) => drop(Box::leak(Box::new(d))),
+                        Err(e) => tracing::error!("held-buttons hook: {e}"),
+                    }
+                }
+                Err(e) => tracing::error!("held-buttons hook: {e}"),
+            }
+            let _ = spawn::ADDR.set(o);
+        }
+        Err(e) => tracing::error!("spawn/held-buttons lookups failed, using the game's buddy: {e}"),
+    }
+    if let Err(e) = install_free_aim(m, base) {
+        tracing::error!("free-aim pod hook: {e}"); // her pod then only fires at entities near the aim point
+    }
+    Ok(())
+}
+
+/// Image offsets of (hook site, resume address) for the free-aim hook.
+fn resolve_free_aim(m: &[u8]) -> Result<(usize, usize), String> {
+    let at = scan::parse(patterns::POD_NO_TARGET).and_then(|p| scan::find_unique(m, &p)).ok_or("POD_NO_TARGET not found")?;
+    let resume = at + 4 + m[at + 3] as i8 as isize as usize;
+    if m.get(resume..resume + 7) != Some(&patterns::AIM_COPY[..]) {
+        return Err(format!("unexpected code at aim copy {resume:#x}"));
+    }
+    Ok((at + 0x1C, resume))
+}
+
+fn install_free_aim(m: &[u8], base: usize) -> Result<(), String> {
+    let (site, resume) = resolve_free_aim(m)?;
+    FREE_AIM_RESUME.store(base + resume, Relaxed);
+    // shortcut: mid-function detour like `held_store`; the overwritten `test rax,rax; je rel32` is relocated by retour.
+    unsafe {
+        let d = RawDetour::new((base + site) as *const (), free_aim_thunk as *const ()).map_err(|e| e.to_string())?;
+        FREE_AIM_TRAMPOLINE.store(d.trampoline() as *const () as usize, Relaxed);
+        d.enable().map_err(|e| e.to_string())?;
+        Box::leak(Box::new(d));
+    }
+    tracing::info!("free-aim pod hook at {:#x}", base + site);
+    Ok(())
+}
+
+/// Mid-function hook in pod_shot where a non-player pod found no target (rax = 0; rdi = Pl0000, rbp = frame).
+/// For the remote, `on_free_aim` writes the peer's aim point into the frame's aim vector ([rbp-0x60]) and the
+/// shot continues at the aim copy as if a target were there; otherwise the original `test; je exit` runs.
+#[unsafe(naked)]
+unsafe extern "system" fn free_aim_thunk() {
+    core::arch::naked_asm!(
+        "test rax, rax",
+        "jnz 2f",
+        "pushfq",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push rbx",
+        "mov rcx, rdi",
+        "lea rdx, [rbp-0x60]",
+        "mov rbx, rsp",
+        "and rsp, -16",
+        "sub rsp, 0x80",
+        "movdqa [rsp+0x20], xmm0",
+        "movdqa [rsp+0x30], xmm1",
+        "movdqa [rsp+0x40], xmm2",
+        "movdqa [rsp+0x50], xmm3",
+        "movdqa [rsp+0x60], xmm4",
+        "movdqa [rsp+0x70], xmm5",
+        "call {f}",
+        "movdqa xmm0, [rsp+0x20]",
+        "movdqa xmm1, [rsp+0x30]",
+        "movdqa xmm2, [rsp+0x40]",
+        "movdqa xmm3, [rsp+0x50]",
+        "movdqa xmm4, [rsp+0x60]",
+        "movdqa xmm5, [rsp+0x70]",
+        "mov rsp, rbx",
+        "mov [rbx+0x38], rax", // the saved rax slot: pops hand the result back in rax (it was 0 on entry)
+        "pop rbx",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "popfq",
+        "test rax, rax",
+        "jnz 3f",
+        "2:",
+        "jmp qword ptr [rip + {tramp}]",
+        "3:",
+        "jmp qword ptr [rip + {resume}]",
+        f = sym on_free_aim,
+        tramp = sym FREE_AIM_TRAMPOLINE,
+        resume = sym FREE_AIM_RESUME,
+    )
+}
+
+/// Returns 1 after writing the peer's aim point to `out` when `pl` is the remote and the peer is firing.
+extern "system" fn on_free_aim(pl: usize, out: *mut cVec4) -> usize {
+    let b = BUDDY.load(Relaxed);
+    if b == 0 || pl != b || out.is_null() || !REMOTE_ACTIVE.load(Relaxed) {
+        return 0;
+    }
+    match REMOTE.load() {
+        // `out` is pod_shot's own stack slot for the aim vector (see POD_NO_TARGET).
+        Some(s) if s.held & sdk::HELD_POD_FIRE != 0 => {
+            unsafe { out.write_unaligned(s.aim) };
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// Mid-function hook at `held_store`: saves every volatile register and flags, calls `on_held(rcx)`,
+/// restores them and continues with the relocated original instruction. Stack alignment is unknown
+/// mid-function, so it aligns explicitly.
+#[unsafe(naked)]
+unsafe extern "system" fn held_thunk() {
+    core::arch::naked_asm!(
+        "pushfq",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push rbx",
+        "mov rbx, rsp",
+        "and rsp, -16",
+        "sub rsp, 0x80", // 0x20 shadow + 6 xmm
+        "movdqa [rsp+0x20], xmm0",
+        "movdqa [rsp+0x30], xmm1",
+        "movdqa [rsp+0x40], xmm2",
+        "movdqa [rsp+0x50], xmm3",
+        "movdqa [rsp+0x60], xmm4",
+        "movdqa [rsp+0x70], xmm5",
+        "call {f}", // rcx is still the controller
+        "movdqa xmm0, [rsp+0x20]",
+        "movdqa xmm1, [rsp+0x30]",
+        "movdqa xmm2, [rsp+0x40]",
+        "movdqa xmm3, [rsp+0x50]",
+        "movdqa xmm4, [rsp+0x60]",
+        "movdqa xmm5, [rsp+0x70]",
+        "mov rsp, rbx",
+        "pop rbx",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "popfq",
+        "jmp qword ptr [rip + {tramp}]",
+        f = sym on_held,
+        tramp = sym HELD_TRAMPOLINE,
+    )
+}
+
+/// The engine just rebuilt held_flags from its input source (pad or AI); for the remote, use the peer's.
+extern "system" fn on_held(ctrl: usize) {
+    let b = BUDDY.load(Relaxed);
+    // Only an exact match with this frame's validated buddy is dereferenced.
+    if b != 0 && ctrl.wrapping_sub(sdk::CONTROLLER_OFFSET) == b && REMOTE_ACTIVE.load(Relaxed) {
+        set_held(b as *mut Pl0000, REMOTE_HELD.load(Relaxed));
+    }
+}
+
+/// The remote counts as AI-controlled, so its pod reads `ai_pod_fire` instead of the pod-fire held bit.
+fn set_held(b: *mut Pl0000, held: u32) {
+    unsafe {
+        addr_of_mut!((*b).held_flags).write(held);
+        addr_of_mut!((*b).ai_pod_fire).write((held & sdk::HELD_POD_FIRE != 0) as i32);
+    }
+}
+
+/// Image offsets of (entity-list global, possessed-handle global, update function).
+fn resolve(m: &[u8]) -> Result<(usize, usize, usize), String> {
+    let pat = |name: &str, p: &str| scan::parse(p).ok_or(format!("{name}: invalid pattern"));
+    let unique = |name: &str, p: &[Option<u8>]| scan::find_unique(m, p).ok_or(format!("{name}: not found or not unique"));
+
+    let (p, disp, end) = patterns::ENTITY_LIST;
+    let at = unique("ENTITY_LIST", &pat("ENTITY_LIST", p)?)?;
+    let list = scan::rip_target(m, at, disp, end).ok_or("ENTITY_LIST: bad rip target")?;
+    if list < sdk::ENTITY_COUNT_BEFORE_LIST {
+        return Err("ENTITY_LIST: count outside module".into());
+    }
+
+    let s: Vec<_> = patterns::POSSESSED_STRING.bytes().chain([0]).map(Some).collect();
+    let s = unique("POSSESSED_STRING", &s)?;
+    let r = scan::find_ref(m, s).ok_or("POSSESSED_STRING: no code reference")? + 4;
+    let window = m.get(r..r + 10).ok_or("POSSESSED_LEA: past module end")?;
+    let lea = r + scan::find_unique(window, &pat("POSSESSED_LEA", patterns::POSSESSED_LEA)?)
+        .ok_or("POSSESSED_LEA: not found after string reference")?;
+    let possessed = scan::rip_target(m, lea, 3, 7).ok_or("POSSESSED_LEA: bad rip target")?;
+
+    let mid = unique("UPDATE_MIDDLE", &pat("UPDATE_MIDDLE", patterns::UPDATE_MIDDLE)?)?;
+    let update = scan::rfind(m, mid, 0x100, &pat("int3", "CC CC CC")?).ok_or("UPDATE: function start not found")? + 3;
+    Ok((list, possessed, update))
+}
+
+/// Entry hook for the update function, whose signature is unknown: saves every argument register,
+/// calls `on_tick`, restores them and jumps to the original with the stack untouched.
+#[unsafe(naked)]
+unsafe extern "system" fn tick_thunk() {
+    core::arch::naked_asm!(
+        "push rcx",
+        "push rdx",
+        "push r8",
+        "push r9",
+        "sub rsp, 0x68", // 0x20 shadow + 4 xmm; entry rsp%16==8, +0x20 pushes +0x68 -> aligned
+        "movdqu [rsp+0x20], xmm0",
+        "movdqu [rsp+0x30], xmm1",
+        "movdqu [rsp+0x40], xmm2",
+        "movdqu [rsp+0x50], xmm3",
+        "call {tick}",
+        "movdqu xmm0, [rsp+0x20]",
+        "movdqu xmm1, [rsp+0x30]",
+        "movdqu xmm2, [rsp+0x40]",
+        "movdqu xmm3, [rsp+0x50]",
+        "add rsp, 0x68",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rcx",
+        "jmp qword ptr [rip + {tramp}]",
+        tick = sym on_tick,
+        tramp = sym TICK_TRAMPOLINE,
+    )
+}
+
+extern "system" fn on_tick() {
+    let pl = player();
+    PLAYER.store(pl.map_or(0, |p| p as usize), Relaxed);
+    let spawned = entity_by_handle(SPAWNED.load(Relaxed)).and_then(as_pl0000);
+    // She is registered as the partner, so her death fails the mission: keep her invincible (her real damage
+    // happens on the peer's machine) and showing the peer's health, also while the local player is in a flight unit.
+    if let Some(b) = spawned {
+        unsafe { addr_of_mut!((*b).muteki_timer).write(300.0) }; // the value Pl0000.setEventMuteki uses
+        if let Some(s) = REMOTE.load() {
+            unsafe { addr_of_mut!((*b).health).write(s.hp.max(1)) };
+        }
+    }
+    let Some(pl) = pl else {
+        BUDDY.store(0, Relaxed);
+        return;
+    };
+    hook_start_animation(pl);
+    let wait = SPAWN_WAIT.load(Relaxed);
+    SPAWN_WAIT.store(wait.saturating_sub(1), Relaxed);
+    if REMOTE_ACTIVE.load(Relaxed) && SPAWN_2B.load(Relaxed) && spawned.is_none() && wait == 0 {
+        SPAWN_WAIT.store(300, Relaxed); // ~5 s
+        let h = unsafe { (POSSESSED.load(Relaxed) as *const u32).read_volatile() };
+        // On success she is now pl's buddy; on failure the game's buddy is used until the next attempt.
+        if spawn::partner(pl, h).is_some() {
+            SPAWNED.store(unsafe { addr_of_mut!((*pl).buddy_handle).read() }, Relaxed);
+        }
+    }
+    let buddy = unsafe { entity_by_handle(addr_of_mut!((*pl).buddy_handle).read()) }.and_then(as_pl0000);
+    BUDDY.store(buddy.map_or(0, |b| b as usize), Relaxed);
+
+    let anim: [u32; 5] = std::array::from_fn(|i| ANIM[i].load(Relaxed));
+    unsafe {
+        let buttons = addr_of_mut!((*pl).buttons).read();
+        if buttons.iter().any(|&b| b != 0) {
+            for (a, v) in BTN.iter().zip(buttons) {
+                a.store(v, Relaxed);
+            }
+            BTN[8].fetch_add(1, Relaxed);
+        }
+        LOCAL.store(&PlayerState {
+            pos: addr_of_mut!((*pl).position).read(),
+            rot: addr_of_mut!((*pl).rotation).read(),
+            facing2: addr_of_mut!((*pl).facing2).read(),
+            hp: addr_of_mut!((*pl).health).read(),
+            anim: [anim[0], anim[1], anim[2], anim[3]],
+            anim_seq: anim[4],
+            speed: addr_of_mut!((*pl).speed).read(),
+            held: addr_of_mut!((*pl).held_flags).read(),
+            buttons: std::array::from_fn(|i| BTN[i].load(Relaxed)),
+            btn_seq: BTN[8].load(Relaxed),
+            aim: addr_of_mut!((*pl).pod_aim).read(),
+        });
+    }
+    if let (Some(b), true) = (buddy, REMOTE_ACTIVE.load(Relaxed)) {
+        if let Some(s) = REMOTE.load() {
+            apply_state(b, &s);
+        }
+    }
+}
+
+fn in_module(addr: usize) -> bool {
+    MODULE.get().is_some_and(|m| (m.as_ptr() as usize..m.as_ptr() as usize + m.len()).contains(&addr))
+}
+
+/// Looks up a live entity; rejects out-of-range indices and stale handles like the engine does.
+fn entity_by_handle(handle: u32) -> Option<*mut Entity> {
+    let g = ENTITY_LIST.load(Relaxed);
+    if g == 0 || handle == 0 {
+        return None;
+    }
+    unsafe {
+        let list = (g as *const *const EntityDescriptor).read_volatile();
+        let count = ((g - sdk::ENTITY_COUNT_BEFORE_LIST) as *const u32).read_volatile() as usize;
+        let i = ((handle >> 8) & 0xFFFF) as usize;
+        if list.is_null() || i >= count {
+            return None;
+        }
+        let d = list.add(i).read_volatile();
+        ((d.handle ^ handle) & 0xFFFF_FF00 == 0 && !d.ent.is_null()).then_some(d.ent)
+    }
+}
+
+/// Within this distance of the aim point an entity counts as aimed at.
+const AIM_RADIUS: f32 = 4.0;
+
+/// Handle of the entity whose position is closest to `aim` (within `AIM_RADIUS`), skipping `skip`.
+/// shortcut: no aim point near any entity (firing into empty space) means no target, so her pod stays silent;
+/// add a fallback target if free-aim shots must show on the other screen.
+fn nearest_entity(aim: cVec4, skip: *mut Pl0000) -> Option<u32> {
+    let g = ENTITY_LIST.load(Relaxed);
+    if g == 0 {
+        return None;
+    }
+    let mut best = (AIM_RADIUS * AIM_RADIUS, None);
+    unsafe {
+        let list = (g as *const *const EntityDescriptor).read_volatile();
+        let count = ((g - sdk::ENTITY_COUNT_BEFORE_LIST) as *const u32).read_volatile() as usize;
+        if list.is_null() {
+            return None;
+        }
+        for i in 0..count {
+            let d = list.add(i).read_volatile();
+            let Some(e) = d.ent.as_ref() else { continue };
+            let b = e.behavior;
+            // Only real game objects: every list behavior with a game vtable is a Behavior, which is larger than
+            // Model::position (0x50..0x60). pod_shot itself rejects non-model targets (0x385f10 returns null).
+            if b.is_null() || b == skip || !in_module(b.as_ref().map_or(0, |o| o.vtable as usize)) {
+                continue;
+            }
+            let p = addr_of_mut!((*b).position).read();
+            let dd = (p.x - aim.x).powi(2) + (p.y - aim.y).powi(2) + (p.z - aim.z).powi(2);
+            if dd < best.0 {
+                best = (dd, Some(e.handle));
+            }
+        }
+    }
+    best.1
+}
+
+/// The entity's behavior, only if its vtable is the `Pl0000` one (so the struct size is known).
+fn as_pl0000(e: *mut Entity) -> Option<*mut Pl0000> {
+    let b = unsafe { addr_of_mut!((*e).behavior).read() };
+    let vt = unsafe { b.as_ref()? }.vtable as usize;
+    let known = PL_VTABLE.load(Relaxed);
+    (known != 0 && vt == known).then_some(b)
+}
+
+/// The possessed entity as a `Pl0000`. The first time it is named "Player", its vtable becomes the reference.
+fn player() -> Option<*mut Pl0000> {
+    let h = match POSSESSED.load(Relaxed) {
+        0 => return None,
+        g => unsafe { (g as *const u32).read_volatile() },
+    };
+    let e = entity_by_handle(h)?;
+    if PL_VTABLE.load(Relaxed) == 0 {
+        let name = unsafe { addr_of_mut!((*e).name).read() };
+        let b = unsafe { addr_of_mut!((*e).behavior).read().as_ref()? };
+        if name.starts_with(b"Player\0") && in_module(b.vtable as usize) {
+            PL_VTABLE.store(b.vtable as usize, Relaxed);
+            tracing::info!("Pl0000 vtable {:#x}", b.vtable as usize);
+        }
+    }
+    as_pl0000(e) // None while hacking/controlling a non-Pl0000
+}
+
+fn hook_start_animation(pl: *mut Pl0000) {
+    if StartAnim.is_enabled() {
+        return;
+    }
+    unsafe {
+        let slot = (*pl).vtable.add(sdk::START_ANIMATION_INDEX);
+        if !in_module(slot as usize) || !in_module(slot.read()) {
+            return;
+        }
+        type F = unsafe extern "system" fn(*mut Pl0000, u32, u32, u32, u32);
+        match StartAnim.initialize(std::mem::transmute::<usize, F>(slot.read()), start_animation).and_then(|d| d.enable()) {
+            Ok(()) => tracing::info!("start_animation hooked at {:#x}", slot.read()),
+            Err(e) => tracing::error!("start_animation detour: {e}"),
+        }
+    }
+}
+
+fn start_animation(this: *mut Pl0000, anim: u32, variant: u32, a3: u32, a4: u32) {
+    let p = this as usize;
+    let who = if p == 0 { "?" } else if p == PLAYER.load(Relaxed) { "player" } else if p == BUDDY.load(Relaxed) { "buddy" } else { "other" };
+    tracing::debug!("anim {who}: {anim:#x} {variant:#x} {a3:#x} {a4:#x}");
+    // The remote's own calls are kept (they come from the synced inputs), except the partner AI's wait state.
+    if p != 0 && p == BUDDY.load(Relaxed) && anim == sdk::ANIM_PARTNER_WAIT && REMOTE_ACTIVE.load(Relaxed) {
+        return;
+    }
+    if p != 0 && p == PLAYER.load(Relaxed) {
+        for (a, v) in ANIM.iter().zip([anim, variant, a3, a4]) {
+            a.store(v, Relaxed);
+        }
+        ANIM[4].fetch_add(1, Relaxed);
+    }
+    unsafe { StartAnim.call(this, anim, variant, a3, a4) }
+}
+
+fn apply_state(b: *mut Pl0000, s: &PlayerState) {
+    unsafe {
+        // Smooth 30 Hz packets over 60 fps frames by moving halfway each tick.
+        let pos = addr_of_mut!((*b).position);
+        let (c, t) = (pos.read(), s.pos);
+        pos.write(cVec4 { x: c.x + (t.x - c.x) * 0.5, y: c.y + (t.y - c.y) * 0.5, z: c.z + (t.z - c.z) * 0.5, w: t.w });
+        // shortcut: rotation snaps (no yaw-wrap interpolation); fine at 30 Hz, interpolate if turning looks jerky.
+        addr_of_mut!((*b).rotation).write(s.rot);
+        addr_of_mut!((*b).facing2).write(s.facing2);
+        // Controller inputs: the engine turns these into walk/run/stop and attacks on its own.
+        addr_of_mut!((*b).run_speed_type).write(0); // speed from the controller, not buddy AI
+        addr_of_mut!((*b).speed).write(s.speed);
+        let mut held = s.held;
+        if s.btn_seq != APPLIED_BTN_SEQ.swap(s.btn_seq, Relaxed) {
+            addr_of_mut!((*b).buttons).write(s.buttons);
+            held |= s.buttons.iter().enumerate().filter(|(_, v)| **v != 0).fold(0, |h, (i, _)| h | 1 << i);
+        }
+        REMOTE_HELD.store(held, Relaxed);
+        set_held(b, held); // also forced in `on_held` when that hook is installed
+        if held & sdk::HELD_POD_FIRE != 0 {
+            // Her pod aims at a target entity, not a camera ray: use what sits at the remote player's aim point.
+            addr_of_mut!((*b).pod_target).write(nearest_entity(s.aim, b).unwrap_or(0));
+        }
+        let [a, ..] = s.anim;
+        let replay = !sdk::ANIM_CRASHES.contains(&a) && !sdk::ANIM_FROM_INPUT.contains(&a);
+        if s.anim_seq != APPLIED_ANIM_SEQ.swap(s.anim_seq, Relaxed) && replay && StartAnim.is_enabled() {
+            let [a, v, a3, a4] = s.anim;
+            tracing::debug!("anim replay on buddy: {a:#x} {v:#x} {a3:#x} {a4:#x}");
+            StartAnim.call(b, a, v, a3, a4); // original, bypassing the buddy filter
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    /// Maps a PE file's sections to their virtual offsets, like the loader does (no relocations or imports).
+    pub fn map_image(f: &[u8]) -> Vec<u8> {
+        let rd = |o: usize, n: usize| f.get(o..o + n).map(|b| b.iter().rev().fold(0usize, |a, &x| a << 8 | x as usize)).unwrap();
+        let pe = rd(0x3C, 4);
+        let (n, opt) = (rd(pe + 6, 2), rd(pe + 20, 2));
+        let mut img = vec![0u8; rd(pe + 24 + 56, 4)]; // SizeOfImage
+        img[..0x1000.min(f.len())].copy_from_slice(&f[..0x1000.min(f.len())]);
+        for i in 0..n {
+            let s = pe + 24 + opt + 40 * i;
+            let (va, raw, len) = (rd(s + 12, 4), rd(s + 20, 4), rd(s + 16, 4).min(rd(s + 8, 4)));
+            img[va..va + len].copy_from_slice(&f[raw..raw + len]);
+        }
+        img
+    }
+
+    /// Run with `NIER_EXE=<path to NieRAutomata.exe> cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn resolves_against_installed_exe() {
+        let img = map_image(&std::fs::read(std::env::var("NIER_EXE").unwrap()).unwrap());
+        let r = super::resolve(&img);
+        println!("{r:x?}");
+        r.unwrap();
+        // Checked exe: hook on `test rax,rax` at 0x48b943, resume at the aim copy 0x48b992 (both inside pod_shot).
+        let (site, resume) = super::resolve_free_aim(&img).unwrap();
+        assert_eq!(&img[site..site + 5], &[0x48, 0x85, 0xC0, 0x0F, 0x84]);
+        assert_eq!((site, resume), (0x48b943, 0x48b992));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod exe_checks {
+    use super::tests::map_image;
+    use crate::scan;
+
+    fn u32_at(m: &[u8], o: usize) -> usize {
+        u32::from_le_bytes(m[o..o + 4].try_into().unwrap()) as usize
+    }
+    /// Begin RVAs from .pdata (exception directory), i.e. every real function start.
+    pub(crate) fn func_starts(m: &[u8]) -> Vec<usize> {
+        let pe = u32_at(m, 0x3C);
+        let (rva, size) = (u32_at(m, pe + 24 + 112 + 3 * 8), u32_at(m, pe + 24 + 112 + 3 * 8 + 4));
+        (rva..rva + size).step_by(12).map(|o| u32_at(m, o)).collect()
+    }
+    fn count(m: &[u8], p: &str) -> usize {
+        let p = scan::parse(p).unwrap();
+        m.windows(p.len()).filter(|w| w.iter().zip(&p).all(|(b, q)| q.is_none_or(|q| q == *b))).count()
+    }
+
+    /// Prints layout evidence from the installed exe. `NIER_EXE=... cargo test exe_checks -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn layout_evidence() {
+        let m = map_image(&std::fs::read(std::env::var("NIER_EXE").unwrap()).unwrap());
+        let pe = u32_at(&m, 0x3C);
+        let image_base = u64::from_le_bytes(m[pe + 24 + 24..pe + 24 + 32].try_into().unwrap());
+        let starts = func_starts(&m);
+        let (_, _, update) = super::resolve(&m).unwrap();
+        println!("update {update:#x} is a function start: {}", starts.binary_search(&update).is_ok());
+        println!("update first bytes: {:02x?}", &m[update..update + 16]);
+
+        // RTTI: TypeDescriptor name -> CompleteObjectLocator -> vtable.
+        let name: Vec<_> = b".?AVPl0000@@\0".iter().map(|&b| Some(b)).collect();
+        let td = scan::find_unique(&m, &name).expect("Pl0000 RTTI name") - 0x10;
+        let col = (0..m.len() - 0x18).step_by(4)
+            .find(|&o| u32_at(&m, o) == 1 && u32_at(&m, o + 4) == 0 && u32_at(&m, o + 0xC) == td && u32_at(&m, o + 0x14) == o)
+            .expect("Pl0000 COL");
+        let col_va = (image_base + col as u64).to_le_bytes();
+        let meta = (0..m.len() - 8).step_by(8).find(|&o| m[o..o + 8] == col_va).expect("Pl0000 vtable");
+        let vt = meta + 8;
+        let slot = |i: usize| (u64::from_le_bytes(m[vt + 8 * i..vt + 8 * i + 8].try_into().unwrap()) - image_base) as usize;
+        println!("Pl0000 vtable rva {vt:#x}");
+        for i in 16..=20 {
+            let f = slot(i);
+            println!("  slot {i}: {f:#x} func_start={} bytes {:02x?}", starts.binary_search(&f).is_ok(), &m[f..f + 12]);
+        }
+
+        // Struct size and field displacements as they appear in code (disp32 little-endian).
+        for (what, p) in [
+            ("alloc 0x17920 (mov reg,imm32)", "20 79 01 00"),
+            ("buddy_handle 0x1647C", "7C 64 01 00"),
+            ("facing2 0x143C", "3C 14 00 00"),
+            ("health 0x858", "58 08 00 00"),
+            ("controller 0xCA0", "A0 0C 00 00"),
+            ("old-size neighbours 0x17910/0x17930", "10 79 01 00"),
+        ] {
+            println!("{what}: {}", count(&m[0x1000..0xc1b000], p));
+        }
+    }
+}

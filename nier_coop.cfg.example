@@ -1,0 +1,8 @@
+# Copy to nier_coop.cfg in the game folder (next to NieRAutomata.exe).
+# Each player binds locally and points peer at the other player's IP:port (forward the UDP port).
+bind=0.0.0.0:27015
+peer=203.0.113.5:27015
+# Optional: show the other player as a spawned 2B (otherwise the game's buddy, e.g. 9S, stands in).
+spawn_2b=true
+# Test only, with bind = peer (mirror test): keep the copy idle; if it still reacts to your controller, report it.
+# mirror_idle=true

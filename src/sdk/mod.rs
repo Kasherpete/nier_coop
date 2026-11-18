@@ -1,7 +1,7 @@
 //! Reversed engine types and patterns for the current Steam build (post-2021 "Become as Gods" exe).
 //!
 //! Source: praydog/AutomataMP (MIT), `reversing/nierautomata.genny` and `shared/sdk/*`, last updated
-//! 2024-01-20 against the Steam build. Not yet verified in-game by this project.
+//! 2024-01-20 against the Steam build, plus this project's own reversing (exe built 2026-10-09).
 
 use std::mem::offset_of;
 
@@ -42,9 +42,7 @@ pub struct Pl0000 {
     pub facing2: f32,          // 0x0143C CharacterController::facing (@0x79C), stick direction
     _pad_01440: [u8; 0xEF24],  // 0x01440
     pub muteki_timer: f32,     // 0x10364 invincible while > 0; script Pl0000.setEventMuteki sets 300.0
-    _pad_10368: [u8; 0x7FC],   // 0x10368
-    pub player_controlled: u32, // 0x10B64 returned by vtable +0x350; 1 for the possessed character, 0 for the remote
-    _pad_10b68: [u8; 0x1C98],  // 0x10B68
+    _pad_10368: [u8; 0x2498],  // 0x10368 (0x10B64: vtable +0x350's player-controlled flag, 0 for the remote)
     pub pod_aim: cVec4,        // 0x12800 world point pod_shot aims at (camera ray for the player, pod_target for others)
     _pad_12810: [u8; 0x3C6C],  // 0x12810
     pub buddy_handle: u32,     // 0x1647C
@@ -52,7 +50,9 @@ pub struct Pl0000 {
     pub run_speed_type: u32,   // 0x16488 0 = player (speed from controller), 1 = buddy (speed from AI)
     _pad_1648c: [u8; 0x50],    // 0x1648C
     pub pod_target: u32,       // 0x164DC entity handle a non-player-controlled pod shoots at; 0 = pod_shot fires nothing
-    _pad_164e0: [u8; 0x1440],  // 0x164E0
+    _pad_164e0: [u8; 0x550],   // 0x164E0
+    pub pod_cooldown: [[f32; 2]; 3], // 0x16A30 per pod index: [full, remaining]; a program starts only at remaining <= 0
+    _pad_16a48: [u8; 0xED8],   // 0x16A48
 }
 const _: () = {
     assert!(size_of::<Pl0000>() == 0x17920);
@@ -66,10 +66,10 @@ const _: () = {
     assert!(offset_of!(Pl0000, speed) == 0x1434);
     assert!(offset_of!(Pl0000, facing2) == 0x143C);
     assert!(offset_of!(Pl0000, muteki_timer) == 0x10364);
-    assert!(offset_of!(Pl0000, player_controlled) == 0x10B64);
     assert!(offset_of!(Pl0000, pod_aim) == 0x12800);
     assert!(offset_of!(Pl0000, buddy_handle) == 0x1647C);
     assert!(offset_of!(Pl0000, pod_target) == 0x164DC);
+    assert!(offset_of!(Pl0000, pod_cooldown) == 0x16A30);
     assert!(offset_of!(Pl0000, run_speed_type) == 0x16488);
 };
 
@@ -77,6 +77,14 @@ const _: () = {
 pub const CONTROLLER_OFFSET: usize = 0xCA0;
 /// `held_flags` bit of the pod fire button (`buttons[6]`).
 pub const HELD_POD_FIRE: u32 = 1 << 6;
+/// `Pl0000` u32 fields that must all be 0 before the engine runs the pod-program update (gates in 0x528c70).
+pub const POD_PROGRAM_BLOCKERS: [usize; 5] = [0x17678, 0x12A68, 0x12AA4, 0x165FC, 0x12AEC];
+/// `Pl0000` flags field whose bit 0x20 also blocks it.
+pub const POD_PROGRAM_FLAGS: usize = 0x16D18;
+/// `Pl0000` u32 index of the active pod (into the pod handles at 0x10810 and `pod_cooldown`).
+pub const POD_INDEX: usize = 0x10820;
+/// `Pl0000` state id; states 0x41 and 0x46 block it.
+pub const PL_STATE: usize = 0x670;
 /// `EModel` of 2B.
 pub const MODEL_2B: u32 = 0x10000;
 /// `start_animation` ids that crash the game when started on another character (AutomataMP `EAnimation`).
@@ -196,6 +204,9 @@ pub mod patterns {
     /// In pod_shot, non-player branch: `jne aim_copy; target = entity(pl->pod_target); test rax,rax; je exit`.
     /// Hook at +0x1C (`test rax,rax`); `aim_copy` (`lea rcx,[rdi+0x12800]`) is the `jne` rel8 target at +2.
     pub const POD_NO_TARGET: &str = "85 C0 75 ? 48 8D 97 DC 64 01 00 48 8D 4D B0 E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? 48 85 C0 0F 84";
+    /// Per-character pod-program update (starts/ends pod skills from held bit 4); the engine's caller (0x528c70 in
+    /// exe 2026-10-09) returns early for non-player-controlled characters, so it never runs for the remote.
+    pub const POD_PROGRAM: &str = "4C 8B DC 57 48 81 EC A0 01 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 50 01 00 00 83 B9 60 5B 01 00 00";
     /// First bytes at `aim_copy`: `lea rcx,[rdi+0x12800]`.
     pub const AIM_COPY: [u8; 7] = [0x48, 0x8D, 0x8F, 0x00, 0x28, 0x01, 0x00];
 }

@@ -172,10 +172,7 @@ mod tests {
         println!("{o:x?}");
         let starts = crate::hooks::exe_checks::func_starts(&img);
         for (n, at) in [("spawn", o.spawn), ("routine", o.routine)] {
-            println!("{n} is a function start: {}", starts.binary_search(&at).is_ok());
-        }
-        for (n, at) in [("spawn", o.spawn), ("routine", o.routine)] {
-            println!("{n} first bytes {:02x?}", &img[at..at + 12]);
+            println!("{n} is a function start: {}, first bytes {:02x?}", starts.binary_search(&at).is_ok(), &img[at..at + 12]);
         }
         println!("held_store bytes {:02x?}", &img[o.held_store..o.held_store + 16]);
     }

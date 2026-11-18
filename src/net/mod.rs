@@ -96,6 +96,7 @@ fn run(cfg: &Config) -> std::io::Result<()> {
         }
         if last_rx.is_some_and(|t| t.elapsed() > TIMEOUT) && REMOTE_ACTIVE.swap(false, Ordering::Relaxed) {
             tracing::warn!("peer timed out; buddy AI restored");
+            rx_seq = None; // a restarted peer counts from 1 again
         }
     }
 }
@@ -115,7 +116,7 @@ pub fn decode(p: &[u8]) -> Option<(u32, PlayerState)> {
     }
     let seq = u32::from_le_bytes(p[4..8].try_into().ok()?);
     let s: PlayerState = bytemuck::pod_read_unaligned(&p[HEADER..]);
-    let v = [s.pos.x, s.pos.y, s.pos.z, s.pos.w, s.rot.x, s.rot.y, s.rot.z, s.rot.w, s.facing2, s.speed, s.aim.x, s.aim.y, s.aim.z, s.aim.w];
+    let v = [s.pos.x, s.pos.y, s.pos.z, s.pos.w, s.rot.x, s.rot.y, s.rot.z, s.rot.w, s.facing2, s.speed, s.aim.x, s.aim.y, s.aim.z, s.aim.w, s.pod_cooldown];
     v.iter().all(|f| f.is_finite() && f.abs() < 1.0e6).then_some((seq, s))
 }
 

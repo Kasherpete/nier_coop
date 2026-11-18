@@ -33,7 +33,7 @@ static BUDDY: AtomicUsize = AtomicUsize::new(0);
 /// Local player's last start_animation args + counter (game thread only).
 static ANIM: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
 static APPLIED_ANIM_SEQ: AtomicU32 = AtomicU32::new(0);
-/// Local player's last non-zero `buttons` + counter, so a press survives until the 30 Hz send.
+/// Local player's last non-zero `buttons` + counter, so a press survives until the next send.
 static BTN: [AtomicU32; 9] = [const { AtomicU32::new(0) }; 9];
 static APPLIED_BTN_SEQ: AtomicU32 = AtomicU32::new(0);
 /// held_flags the mid-hook writes into the remote's controller.
@@ -41,6 +41,7 @@ static REMOTE_HELD: AtomicU32 = AtomicU32::new(0);
 static HELD_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `held_thunk`'s jmp
 static FREE_AIM_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `free_aim_thunk`'s jmps
 static FREE_AIM_RESUME: AtomicUsize = AtomicUsize::new(0);
+static POD_PROGRAM_FN: AtomicUsize = AtomicUsize::new(0);
 /// Set from `nier_coop.cfg` before `install`.
 pub static SPAWN_2B: AtomicBool = AtomicBool::new(false);
 /// Handle of the spawned 2B (0 = none yet); she is spawned again once the game removes her (restart, area load).
@@ -85,6 +86,10 @@ pub fn install() -> Result<(), String> {
             let _ = spawn::ADDR.set(o);
         }
         Err(e) => tracing::error!("spawn/held-buttons lookups failed, using the game's buddy: {e}"),
+    }
+    match scan::parse(patterns::POD_PROGRAM).and_then(|p| scan::find_unique(m, &p)) {
+        Some(at) => POD_PROGRAM_FN.store(base + at, Relaxed),
+        None => tracing::error!("POD_PROGRAM not found; the remote's pod skill stays off"),
     }
     if let Err(e) = install_free_aim(m, base) {
         tracing::error!("free-aim pod hook: {e}"); // her pod then only fires at entities near the aim point
@@ -360,13 +365,49 @@ extern "system" fn on_tick() {
             buttons: std::array::from_fn(|i| BTN[i].load(Relaxed)),
             btn_seq: BTN[8].load(Relaxed),
             aim: addr_of_mut!((*pl).pod_aim).read(),
+            pod_cooldown: pod_cooldown_slot(pl).map_or(0.0, |c| c.read()),
         });
     }
     if let (Some(b), true) = (buddy, REMOTE_ACTIVE.load(Relaxed)) {
         if let Some(s) = REMOTE.load() {
             apply_state(b, &s);
+            run_pod_program(b, s.pod_cooldown);
         }
     }
+}
+
+/// u32 at a byte offset of a validated `Pl0000`, for fields not worth a struct member.
+fn pl_u32(b: *mut Pl0000, off: usize) -> u32 {
+    assert!(!b.is_null() && off + 4 <= size_of::<Pl0000>());
+    unsafe { (b as *const u8).add(off).cast::<u32>().read_unaligned() }
+}
+
+/// The remaining-cooldown slot of the active pod; None if the index is out of range.
+fn pod_cooldown_slot(pl: *mut Pl0000) -> Option<*mut f32> {
+    let i = pl_u32(pl, sdk::POD_INDEX) as usize;
+    let all = unsafe { addr_of_mut!((*pl).pod_cooldown) };
+    (i < 3).then(|| unsafe { addr_of_mut!((*all)[i][1]) })
+}
+
+/// The engine runs the pod-program update only for the player-controlled character, so the remote's skill
+/// press never starts a program; run it for her each frame behind the gates the engine applies to everyone.
+/// shortcut: skips the rest of 0x528c70 (player-only input handling); fine while pod skills are all she misses.
+fn run_pod_program(b: *mut Pl0000, peer_cooldown: f32) {
+    // The cooldown only ticks down in the player-only routine; the peer's own value is the right one anyway.
+    if let Some(c) = pod_cooldown_slot(b) {
+        unsafe { c.write(peer_cooldown) };
+    }
+    let f = POD_PROGRAM_FN.load(Relaxed);
+    let state = pl_u32(b, sdk::PL_STATE);
+    if f == 0
+        || sdk::POD_PROGRAM_BLOCKERS.iter().any(|&o| pl_u32(b, o) != 0)
+        || pl_u32(b, sdk::POD_PROGRAM_FLAGS) & 0x20 != 0
+        || state == 0x41
+        || state == 0x46
+    {
+        return;
+    }
+    unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(*mut Pl0000)>(f)(b) }
 }
 
 fn in_module(addr: usize) -> bool {
@@ -395,8 +436,7 @@ fn entity_by_handle(handle: u32) -> Option<*mut Entity> {
 const AIM_RADIUS: f32 = 4.0;
 
 /// Handle of the entity whose position is closest to `aim` (within `AIM_RADIUS`), skipping `skip`.
-/// shortcut: no aim point near any entity (firing into empty space) means no target, so her pod stays silent;
-/// add a fallback target if free-aim shots must show on the other screen.
+/// None means free aim: `on_free_aim` then shoots at the aim point itself.
 fn nearest_entity(aim: cVec4, skip: *mut Pl0000) -> Option<u32> {
     let g = ENTITY_LIST.load(Relaxed);
     if g == 0 {
@@ -490,11 +530,11 @@ fn start_animation(this: *mut Pl0000, anim: u32, variant: u32, a3: u32, a4: u32)
 
 fn apply_state(b: *mut Pl0000, s: &PlayerState) {
     unsafe {
-        // Smooth 30 Hz packets over 60 fps frames by moving halfway each tick.
+        // Smooth network jitter by moving halfway each tick.
         let pos = addr_of_mut!((*b).position);
         let (c, t) = (pos.read(), s.pos);
         pos.write(cVec4 { x: c.x + (t.x - c.x) * 0.5, y: c.y + (t.y - c.y) * 0.5, z: c.z + (t.z - c.z) * 0.5, w: t.w });
-        // shortcut: rotation snaps (no yaw-wrap interpolation); fine at 30 Hz, interpolate if turning looks jerky.
+        // shortcut: rotation snaps (no yaw-wrap interpolation); fine at 60 Hz, interpolate if turning looks jerky.
         addr_of_mut!((*b).rotation).write(s.rot);
         addr_of_mut!((*b).facing2).write(s.facing2);
         // Controller inputs: the engine turns these into walk/run/stop and attacks on its own.
@@ -550,6 +590,8 @@ pub(crate) mod tests {
         let (site, resume) = super::resolve_free_aim(&img).unwrap();
         assert_eq!(&img[site..site + 5], &[0x48, 0x85, 0xC0, 0x0F, 0x84]);
         assert_eq!((site, resume), (0x48b943, 0x48b992));
+        let pp = crate::scan::parse(crate::sdk::patterns::POD_PROGRAM).and_then(|p| crate::scan::find_unique(&img, &p));
+        assert_eq!(pp, Some(0x529080));
     }
 }
 

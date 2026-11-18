@@ -20,9 +20,10 @@ pub struct PlayerState {
     pub buttons: [u32; 8], // 0x44 last non-zero controller buttons
     pub btn_seq: u32,   // 0x64 bumped whenever `buttons` was non-zero, so presses replay
     pub aim: cVec4,     // 0x68 pod aim point (Pl0000::pod_aim)
+    pub pod_cooldown: f32, // 0x78 active pod's remaining program cooldown
 }
 const WORDS: usize = size_of::<PlayerState>() / 4;
-const _: () = assert!(size_of::<PlayerState>() == 0x78);
+const _: () = assert!(size_of::<PlayerState>() == 0x7C);
 
 /// Single-writer seqlock holding the latest value. Words are atomics so torn reads are retried, never UB.
 pub struct Slot {

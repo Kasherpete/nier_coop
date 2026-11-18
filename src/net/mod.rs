@@ -137,7 +137,8 @@ fn run(cfg: &Config) -> std::io::Result<()> {
         }
         match sock.recv_from(&mut buf) {
             // Only the configured peer's IP is trusted; anything else is dropped.
-            Ok((n, from)) if from.ip() == cfg.peer.ip() => {
+            // A new port is learned only between sessions, so another program on the peer's IP cannot take over one.
+            Ok((n, from)) if from == peer || (from.ip() == cfg.peer.ip() && !REMOTE_ACTIVE.load(Ordering::Relaxed)) => {
                 if from != peer {
                     tracing::info!("peer answers from {from}");
                     peer = from;

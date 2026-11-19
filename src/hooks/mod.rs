@@ -20,6 +20,7 @@ use crate::state::{
 };
 
 mod lockstep;
+pub mod savefile;
 mod spawn;
 pub(crate) use spawn::crc32;
 mod world;

@@ -9,10 +9,12 @@ Install (both players)
 3. Start NieR:Automata from Steam as usual. A black log window opens with it.
    DO NOT close that window: it closes the game.
 4. If Windows Firewall asks about NieRAutomata, click Allow.
-5. Same save for both: the host loads their save. The other player waits in the title menu until the
-   log says "host's save written to slot N", then loads that slot (Load Game). Their own save in that
-   slot is kept as SlotData_N.dat.nier_coop.bak in Documents\My Games\NieR_Automata.
-   Every time the host saves, the new save is copied again (reload it to catch up).
+5. Same save for both: the HOST starts the game first. When the other player starts theirs, the host's
+   save is copied in during the intro logos (the log says "host's save is in place"); then pick
+   Load Game -> slot N (not Continue). If the host's game was not open yet, the logos wait up to 20 s;
+   after that, restart the game to get the save.
+   Their own save in that slot is kept as SlotData_N.dat.nier_coop.bak in Documents\My Games\NieR_Automata.
+   When the host saves again, the other player gets it on their next game start.
 6. Once both are in game: the log says "connected to ..." when you are connected,
    and the other player shows up as a second 2B.
 

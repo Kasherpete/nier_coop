@@ -92,6 +92,7 @@ pub fn load_config() -> Option<Config> {
 
 pub fn spawn(cfg: Config) {
     std::thread::spawn(move || {
+        crate::hooks::savefile::NO_WAIT.with(|n| n.set(true));
         if let Err(e) = run(&cfg) {
             tracing::error!("network thread stopped: {e}");
         }
@@ -291,6 +292,35 @@ pub fn decode(p: &[u8]) -> Option<(Header, Correction, [InputFrame; REDUNDANCY])
 mod tests {
     use super::*;
     use crate::sdk::cVec4;
+
+    /// Plays the host for a game running as client (`bind=127.0.0.1:27015`, `peer=127.0.0.1:27016`,
+    /// `save_sync=true`): heartbeats plus this PC's newest save, until the game acks it.
+    /// `cargo test fake_host -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn fake_host_for_running_game() {
+        let sock = UdpSocket::bind("127.0.0.1:27016").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+        let game: SocketAddr = "127.0.0.1:27015".parse().unwrap();
+        let mut s = save::SaveSync::new(true).expect("save folder");
+        let (start, mut beat, mut seq) = (Instant::now(), Instant::now() - HEARTBEAT, 0);
+        let mut buf = [0u8; 2048];
+        while start.elapsed() < Duration::from_secs(120) {
+            if beat.elapsed() >= HEARTBEAT {
+                beat = Instant::now();
+                seq += 1;
+                sock.send_to(&encode(Header { seq, epoch: 0, flags: IS_HOST }, &Correction::default(), &[]), game).unwrap();
+            }
+            s.poll(&sock, game).unwrap();
+            if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                if n >= 4 && buf[..4] == save::ACK_MAGIC.to_le_bytes() {
+                    println!("game acked the save after {:?}", start.elapsed());
+                    return;
+                }
+            }
+        }
+        panic!("no ack from the game in 120 s");
+    }
     #[test]
     fn packet_roundtrip_and_rejects() {
         let c = Correction { pos: cVec4 { x: 1.0, y: 2.0, z: 3.0, w: 1.0 }, anim: [7, 0, 0, 0], hp: 100, ..Default::default() };

@@ -117,10 +117,21 @@ impl SaveSync {
             }
             Some(CHUNK_MAGIC) if !self.host => {
                 if let Some((slot, data)) = self.receive(p) {
-                    match self.write(slot, &data) {
+                    let crc = crc32(&data);
+                    let same = std::fs::read(self.dir.join(slot_name(slot))).is_ok_and(|d| crc32(&d) == crc);
+                    let result = if same { Ok(()) } else { self.write(slot, &data) };
+                    if result.is_ok() {
+                        crate::hooks::savefile::SAVE_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    match result {
+                        // The game lists saves only at startup: a save written while it runs shows after a restart.
+                        Ok(()) if same => {
+                            self.written = Some(crc);
+                            tracing::info!("save sync: you have the host's save: Load Game -> slot {} (not Continue)", slot + 1);
+                        }
                         Ok(()) => {
-                            self.written = Some(crc32(&data));
-                            tracing::info!("save sync: host's save written to slot {}; load it from the title menu", slot + 1);
+                            self.written = Some(crc);
+                            tracing::info!("save sync: host's save written to slot {0}: Load Game -> slot {0} (not Continue)", slot + 1);
                         }
                         Err(e) => tracing::error!("save sync: could not write slot {}: {e}", slot + 1),
                     }

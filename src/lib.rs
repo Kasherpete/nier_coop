@@ -19,8 +19,7 @@ extern "system" fn DllMain(module: HMODULE, reason: u32, reserved: *mut c_void) 
         DLL_PROCESS_ATTACH => {
             unsafe {
                 let _ = DisableThreadLibraryCalls(module);
-            }
-            // Loader lock is held here: do no real work, just hand off to a thread.
+            }            // Loader lock is held here: do no real work, just hand off to a thread.
             std::thread::spawn(worker);
         }
         // Non-null `reserved` means the process is exiting; other threads are already dead, so touch nothing.
@@ -71,8 +70,7 @@ fn worker() {
         Some(f) => sub.with_writer(std::io::stdout.and(std::sync::Mutex::new(f))).init(),
         None => sub.init(),
     }
-    tracing::info!("nier_coop loaded");
-    hooks::SPAWN_2B.store(cfg.as_ref().is_some_and(|c| c.spawn_2b), std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("nier_coop loaded");    hooks::SPAWN_2B.store(cfg.as_ref().is_some_and(|c| c.spawn_2b), std::sync::atomic::Ordering::Relaxed);
     hooks::ANIM_REPLAY.store(cfg.as_ref().is_some_and(|c| c.anim_replay), std::sync::atomic::Ordering::Relaxed);
     state::LOCKSTEP.store(cfg.as_ref().is_some_and(|c| c.lockstep), std::sync::atomic::Ordering::Relaxed);
     state::WORLD_SYNC.store(cfg.as_ref().is_some_and(|c| c.world_sync), std::sync::atomic::Ordering::Relaxed);
@@ -81,6 +79,11 @@ fn worker() {
     if let Err(e) = hooks::install() {
         tracing::error!("hooks not installed: {e}");
         return;
+    }
+    if cfg.as_ref().is_some_and(|c| c.save_sync && !c.host) {
+        if let Err(e) = hooks::savefile::install() {
+            tracing::error!("save sync: CreateFileW hook not installed ({e}); restart the game after the save arrives");
+        }
     }
     match cfg {
         Some(cfg) => net::spawn(cfg),

@@ -4,6 +4,8 @@
 //! packet loses nothing; the receiver applies the frames in order (one per tick) to the remote 2B. The
 //! sender's real state rides along only to correct drift.
 
+mod save;
+
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::Ordering;
@@ -58,6 +60,8 @@ pub struct Config {
     pub host: bool,
     /// `world_sync=true` (both players): the host's game owns the enemies, the client copies them.
     pub world_sync: bool,
+    /// `save_sync=true` (both players): the host's newest save slot is copied to the client (see `save.rs`).
+    pub save_sync: bool,
 }
 
 /// Reads `key=value` lines from `nier_coop.cfg` next to the game exe
@@ -82,6 +86,7 @@ pub fn load_config() -> Option<Config> {
         lockstep: flag("lockstep"),
         host: flag("host"),
         world_sync: flag("world_sync"),
+        save_sync: flag("save_sync"),
     })
 }
 
@@ -111,7 +116,14 @@ fn run(cfg: &Config) -> std::io::Result<()> {
     let mut world_rx_seq = None::<u32>;
     let mut buf = [0u8; 2048];
     let mut idle = None::<Correction>;
+    let mut saves = if cfg.save_sync { save::SaveSync::new(cfg.host) } else { None };
+    if cfg.save_sync && saves.is_none() {
+        tracing::error!("save sync: save folder (Documents\\My Games\\NieR_Automata) not found");
+    }
     loop {
+        if let Some(s) = saves.as_mut().filter(|_| REMOTE_ACTIVE.load(Ordering::Relaxed)) {
+            s.poll(&sock, peer)?;
+        }
         // One packet per new local frame, plus a heartbeat while no frames are produced.
         let frames: Vec<InputFrame> = state::lock(&LOCAL_INPUTS).iter().copied().collect();
         let corr = *state::lock(&LOCAL_CORRECTION);
@@ -142,6 +154,11 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 if from != peer {
                     tracing::info!("peer answers from {from}");
                     peer = from;
+                }
+                if let Some(s) = saves.as_mut() {
+                    if s.on_packet(&buf[..n], &sock, peer)? {
+                        continue;
+                    }
                 }
                 if let Some((seq, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {
                     let fresh = world_rx_seq.is_none_or(|r: u32| (seq.wrapping_sub(r) as i32) > 0);
@@ -188,7 +205,9 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                         *state::lock(&REMOTE_CORRECTION) = Some(c);
                     }
                     last_rx = Some(Instant::now());
-                    REMOTE_ACTIVE.store(true, Ordering::Relaxed);
+                    if !REMOTE_ACTIVE.swap(true, Ordering::Relaxed) {
+                        tracing::info!("connected to {from}");
+                    }
                 }
             }
             Ok(_) => {}
@@ -201,6 +220,9 @@ fn run(cfg: &Config) -> std::io::Result<()> {
             rx_seq = None; // a restarted peer counts from 1 again
             rx_epoch = None;
             world_rx_seq = None;
+            if let Some(s) = saves.as_mut() {
+                s.reset();
+            }
             *state::lock(&REMOTE_WORLD) = None;
             state::lock(&REMOTE_DAMAGE).clear();
             REMOTE_READY.store(false, Ordering::Relaxed);

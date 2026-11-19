@@ -21,6 +21,7 @@ use crate::state::{
 
 mod lockstep;
 mod spawn;
+pub(crate) use spawn::crc32;
 mod world;
 
 static_detour! {

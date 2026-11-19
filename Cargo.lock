@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "nier_coop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytemuck",
  "retour",

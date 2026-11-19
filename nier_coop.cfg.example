@@ -7,11 +7,14 @@ spawn_2b=true
 # Experimental world sync (both players), no waiting: the host=true player's game owns the enemies, the other
 # player's enemies follow it and their hits are sent to the host. Needs host=true on exactly one player.
 # world_sync=true
+# Save sync (both players): the host's most recently saved slot is copied to the other player's same slot
+# whenever the host saves (their own file is kept once as SlotData_N.dat.nier_coop.bak). Load it from the title menu.
+# save_sync=true
 # Experimental lockstep (both players): frames advance together and world checksums are compared and logged.
 # Exactly one player also sets host=true (for the mirror test: lockstep=true and host=true).
 # lockstep=true
 # host=true
-# Optional fallback: also replay the other player's animations, if inputs alone leave the copy not walking.
-# anim_replay=true
+# Replay the other player's animations: needed, inputs alone leave the spawned 2B not walking (seen in-game).
+anim_replay=true
 # Test only, with bind = peer (mirror test): keep the copy idle; if it still reacts to your controller, report it.
 # mirror_idle=true

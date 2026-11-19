@@ -57,20 +57,33 @@ Write-Host ''
 if ($myIp) { Write-Host "Your public IP: $myIp   <- send this to your friend" -ForegroundColor Green }
 Write-Host '(Using Tailscale, ZeroTier or Radmin VPN? Send the IP that app shows instead.)'
 while ($true) {
-    $peer = (Read-Host "Your friend's IP").Trim()
+    $peer = (Read-Host "Your friend's IP (or type solo to test alone: a copy of you follows you)").Trim()
     $ip = $null
+    if ($peer -eq 'solo') { break }
+    if ($peer -eq $myIp) {
+        # Routers do not loop packets to your own public IP back to you, so nothing would arrive.
+        Write-Host 'That is YOUR IP. Type your friend''s IP, or solo to test alone.' -ForegroundColor Red
+        continue
+    }
     if ([System.Net.IPAddress]::TryParse($peer, [ref]$ip)) { break }
     Write-Host 'That is not an IP address (like 203.0.113.5).' -ForegroundColor Red
 }
+# Solo (mirror test): this game receives its own packets; the copy stands 2 m aside.
+$bind = if ($peer -eq 'solo') { "127.0.0.1:$port" } else { "0.0.0.0:$port" }
+$peerAddr = if ($peer -eq 'solo') { "127.0.0.1:$port" } else { "${peer}:$port" }
 
 $cfg = Join-Path $game 'nier_coop.cfg'
 if (Test-Path $cfg) { Copy-Item $cfg "$cfg.bak" -Force }
 $lines = @(
     '# Written by Install.bat. Run it again to change the IP or host setting.',
-    "bind=0.0.0.0:$port",
-    "peer=${peer}:$port",
+    "bind=$bind",
+    "peer=$peerAddr",
     'spawn_2b=true',
-    'world_sync=true'
+    # Inputs alone do not start walk/run on the spawned 2B: replay the other player's animations too.
+    'anim_replay=true',
+    'world_sync=true',
+    # The host's newest save is copied into the same slot here (own file kept as SlotData_N.dat.nier_coop.bak).
+    'save_sync=true'
 )
 if ($host_) { $lines += 'host=true' }
 Set-Content -Path $cfg -Value $lines -Encoding ascii
@@ -79,5 +92,5 @@ Write-Host ''
 Write-Host 'Installed.' -ForegroundColor Green
 Write-Host '- Start the game from Steam as usual. A black log window opens with it: do NOT close it (that closes the game).'
 Write-Host '- If Windows Firewall asks about NieRAutomata, click Allow.'
-Write-Host '- Both load into the same area. The log window says "peer answers from ..." once you are connected.'
+Write-Host '- Both load into the same area. The log window says "connected to ..." once you are connected.'
 Write-Host "- After playing, send each other nier_coop.log from: $game"

@@ -155,7 +155,8 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                     tracing::info!("peer answers from {from}");
                     peer = from;
                 }
-                if let Some(s) = saves.as_mut() {
+                // Save data only inside a live session (input packets already flowing), never as a first packet.
+                if let Some(s) = saves.as_mut().filter(|_| REMOTE_ACTIVE.load(Ordering::Relaxed)) {
                     if s.on_packet(&buf[..n], &sock, peer)? {
                         continue;
                     }

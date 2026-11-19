@@ -12,8 +12,9 @@ pub const CHUNK_MAGIC: u32 = u32::from_le_bytes(*b"NCSV");
 pub const ACK_MAGIC: u32 = u32::from_le_bytes(*b"NCSA");
 const CHUNK: usize = 1024;
 const HEAD: usize = 20; // magic, slot, crc, total, offset
-/// Saves are 235,980 bytes (Steam build); anything far bigger is not a save.
-const MAX_SIZE: usize = 1 << 20;
+/// Every save slot is exactly this size (Steam build); anything else is not a save and is never written.
+/// shortcut: no shared key, so a spoofed peer IP:port could still send a save-sized file; add an HMAC key if that matters.
+const SAVE_SIZE: usize = 235_980;
 const SLOTS: u32 = 3;
 /// Gap between chunks: ~0.5 MB/s, a full save in ~0.5 s per round.
 const GAP: Duration = Duration::from_millis(2);
@@ -89,8 +90,8 @@ impl SaveSync {
             return;
         }
         let Ok(data) = std::fs::read(self.dir.join(slot_name(slot))) else { return };
-        if data.is_empty() || data.len() > MAX_SIZE {
-            return;
+        if data.len() != SAVE_SIZE {
+            return; // not a save (checked every second, so no log)
         }
         let crc = crc32(&data);
         if self.out.as_ref().is_some_and(|o| o.crc == crc && o.slot == slot) {
@@ -144,7 +145,7 @@ impl SaveSync {
         let word = |i: usize| p.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
         let (slot, crc, total, off) = (word(1)?, word(2)?, word(3)? as usize, word(4)? as usize);
         let body = &p[HEAD..];
-        if slot >= SLOTS || total == 0 || total > MAX_SIZE || off % CHUNK != 0 || off >= total || body.len() != CHUNK.min(total - off)
+        if slot >= SLOTS || total != SAVE_SIZE || off % CHUNK != 0 || off >= total || body.len() != CHUNK.min(total - off)
         {
             return None;
         }
@@ -282,14 +283,16 @@ mod tests {
         bad = chunks(0, &data)[0][..100].to_vec();
         assert_eq!(s.receive(&bad), None);
         bad = chunks(0, &data)[0].clone();
-        bad[12..16].copy_from_slice(&(MAX_SIZE as u32 + 1).to_le_bytes());
+        bad[12..16].copy_from_slice(&(SAVE_SIZE as u32 + 1).to_le_bytes());
         assert_eq!(s.receive(&bad), None);
         bad = chunks(0, &data)[1].clone();
         bad[16..20].copy_from_slice(&5u32.to_le_bytes());
         assert_eq!(s.receive(&bad), None);
+        // Not save-sized: never assembled, even when complete and CRC-correct.
+        assert_eq!(chunks(0, &data[..3000]).iter().filter_map(|p| s.receive(p)).count(), 0);
 
         // Corrupted data: every chunk arrives but the CRC fails.
-        let mut c = chunks(0, &data[..3000]);
+        let mut c = chunks(0, &data);
         c[1][HEAD] ^= 1;
         assert_eq!(c.iter().filter_map(|p| s.receive(p)).count(), 0);
     }

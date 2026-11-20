@@ -219,6 +219,11 @@ extern "system" fn on_post(queue: usize, from: *const Sender, sig: *const StateR
     r
 }
 
+/// Death or unload: drop the saved sender contexts, which an area unload frees (a stale one would be posted).
+pub fn forget_contexts() {
+    *state::lock(&CONTEXTS) = None;
+}
+
 /// Client, game thread: start the cutscenes the host started and repeat its signals.
 pub fn tick() {
     let sigs = std::mem::take(&mut *state::lock(&REMOTE_SIGNALS));

@@ -198,20 +198,22 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                         continue;
                     }
                 }
+                // Scene signals/events/names, like saves, only inside a live session (never as a first packet).
+                let live = REMOTE_ACTIVE.load(Ordering::Relaxed);
                 if n == 20 && buf[..4] == SIGNAL_MAGIC.to_le_bytes() {
                     let w = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
-                    if !cfg.host && sig_rx.is_none_or(|r| (w(4).wrapping_sub(r) as i32) > 0) {
+                    if live && !cfg.host && sig_rx.is_none_or(|r| (w(4).wrapping_sub(r) as i32) > 0) {
                         sig_rx = Some(w(4));
                         state::lock(&REMOTE_SIGNALS).push([w(8), w(12), w(16)]);
                     }
                 } else if n == 20 && buf[..4] == EVENT_MAGIC.to_le_bytes() {
                     let w = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
                     // The host only takes objectives the client's player reached: kind 2, DONE.
-                    if !cfg.host || (w(8) == 2 && w(12) == 0x26b8_0d1f) {
+                    if live && (!cfg.host || (w(8) == 2 && w(12) == 0x26b8_0d1f)) {
                         state::lock(&REMOTE_EVENTS).push([w(4), w(8), w(12), w(16)]);
                     }
                 } else if n >= 4 && buf[..4] == SCENE_MAGIC.to_le_bytes() {
-                    if !cfg.host {
+                    if live && !cfg.host {
                         *state::lock(&REMOTE_SCENE) = Some(buf[4..n].to_vec()); // validated by the game thread
                     }
                 } else if let Some((seq, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {

@@ -366,6 +366,7 @@ extern "system" fn on_tick() {
     if LOCAL_ALIVE.swap(alive, Relaxed) != alive {
         tracing::info!("local player {}: resetting world sync", if alive { "respawned" } else { "died or unloaded" });
         world::reset();
+        events::forget_contexts();
         if alive {
             SPAWN_WAIT.store(0, Relaxed);
             if let (Some(b), Some(p)) = (spawned, pl) {

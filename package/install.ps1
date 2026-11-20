@@ -55,12 +55,15 @@ $host_ = (Read-Host 'Are you the host? (y/n)') -match '^[yY]'
 $myIp = try { (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 5).ToString().Trim() } catch { $null }
 Write-Host ''
 if ($myIp) { Write-Host "Your public IP: $myIp   <- send this to your friend" -ForegroundColor Green }
-Write-Host '(Using Tailscale, ZeroTier or Radmin VPN? Send the IP that app shows instead.)'
+$ts = Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Tailscale*' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($ts) { Write-Host "Your Tailscale IP: $($ts.IPAddress)   <- using Tailscale? send THIS one instead" -ForegroundColor Green }
+else { Write-Host '(Using Tailscale, ZeroTier or Radmin VPN? Send the IP that app shows instead.)' }
+$localIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object IPAddress)
 while ($true) {
     $peer = (Read-Host "Your friend's IP (or type solo to test alone: a copy of you follows you)").Trim()
     $ip = $null
     if ($peer -eq 'solo') { break }
-    if ($peer -eq $myIp) {
+    if ($peer -eq $myIp -or $localIps -contains $peer) {
         # Routers do not loop packets to your own public IP back to you, so nothing would arrive.
         Write-Host 'That is YOUR IP. Type your friend''s IP, or solo to test alone.' -ForegroundColor Red
         continue

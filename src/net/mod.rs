@@ -13,13 +13,21 @@ use std::time::{Duration, Instant};
 
 use crate::state::{
     self, Correction, Damage, EnemyState, InputFrame, HOST, LOCAL_CORRECTION, LOCAL_DAMAGE, LOCAL_EPOCH, LOCAL_INPUTS, LOCAL_READY,
-    LOCAL_WORLD, MAX_ENEMIES, REDUNDANCY, REMOTE_ACTIVE, REMOTE_CORRECTION, REMOTE_DAMAGE, REMOTE_EPOCH, REMOTE_INPUTS,
-    REMOTE_READY, REMOTE_WORLD,
+    LOCAL_EVENTS, LOCAL_SCENE, LOCAL_SIGNALS, LOCAL_WORLD, MAX_ENEMIES, REDUNDANCY, REMOTE_ACTIVE, REMOTE_CORRECTION, REMOTE_DAMAGE, REMOTE_EPOCH, REMOTE_INPUTS,
+    REMOTE_EVENTS, REMOTE_READY, REMOTE_SCENE, REMOTE_SIGNALS, REMOTE_WORLD,
 };
 
 /// World sync packets: magic, seq, count, then `count` items. Host -> client snapshots, client -> host damage.
 const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"NCWS");
 const DAMAGE_MAGIC: u32 = u32::from_le_bytes(*b"NCWD");
+/// Host -> client, every second: the host's scene state names (newline-separated), for quest sync.
+const SCENE_MAGIC: u32 = u32::from_le_bytes(*b"NCSS");
+const SCENE_EVERY: Duration = Duration::from_secs(1);
+/// [magic, action id, kind, hash, flag] just ran here (see `state::LOCAL_EVENTS`); sent 3 times. Host -> client, and
+/// client -> host for objectives the client's player reached.
+const EVENT_MAGIC: u32 = u32::from_le_bytes(*b"NCEV");
+/// Host -> client: a scene signal, [magic, seq, sender id, hash, arg]; sent 3 times, the client keeps new seqs only.
+const SIGNAL_MAGIC: u32 = u32::from_le_bytes(*b"NCSG");
 
 const MAGIC: u32 = u32::from_le_bytes(*b"NCO3");
 const HEADER: usize = 16; // magic u32, seq u32, epoch u32, flags u32
@@ -115,7 +123,10 @@ fn run(cfg: &Config) -> std::io::Result<()> {
     let mut rx_epoch = None::<u32>;
     let mut warned_hosts = false;
     let mut world_rx_seq = None::<u32>;
-    let mut buf = [0u8; 2048];
+    let mut scene_at = Instant::now();
+    let (mut sig_tx, mut sig_rx) = (0u32, None::<u32>);
+    // shortcut: one datagram per scene list (~1-4 KB, IP-fragmented); split it if late-game lists outgrow 64 KB.
+    let mut buf = vec![0u8; 65536];
     let mut idle = None::<Correction>;
     let mut saves = if cfg.save_sync { save::SaveSync::new(cfg.host) } else { None };
     if cfg.save_sync && saves.is_none() {
@@ -148,6 +159,31 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 sock.send_to(&p, peer)?;
             }
         }
+        if cfg.world_sync && cfg.host {
+            for [id, hash, arg] in std::mem::take(&mut *state::lock(&LOCAL_SIGNALS)) {
+                sig_tx = sig_tx.wrapping_add(1);
+                let p: Vec<u8> = [SIGNAL_MAGIC, sig_tx, id, hash, arg].iter().flat_map(|v| v.to_le_bytes()).collect();
+                for _ in 0..3 {
+                    sock.send_to(&p, peer)?;
+                }
+            }
+        }
+        // Both ways: the client sends the objectives its player reached (see `hooks::events`).
+        if cfg.world_sync {
+            for e in std::mem::take(&mut *state::lock(&LOCAL_EVENTS)) {
+                let p: Vec<u8> = [EVENT_MAGIC].iter().chain(&e).flat_map(|v| v.to_le_bytes()).collect();
+                for _ in 0..3 {
+                    sock.send_to(&p, peer)?;
+                }
+            }
+        }
+        if cfg.world_sync && cfg.host && scene_at.elapsed() >= SCENE_EVERY {
+            scene_at = Instant::now();
+            let names = state::lock(&LOCAL_SCENE).clone();
+            if !names.is_empty() && names.len() < buf.len() - 4 {
+                sock.send_to(&[&SCENE_MAGIC.to_le_bytes()[..], &names].concat(), peer)?;
+            }
+        }
         match sock.recv_from(&mut buf) {
             // Only the configured peer's IP is trusted; anything else is dropped.
             // A new port is learned only between sessions, so another program on the peer's IP cannot take over one.
@@ -162,7 +198,23 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                         continue;
                     }
                 }
-                if let Some((seq, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {
+                if n == 20 && buf[..4] == SIGNAL_MAGIC.to_le_bytes() {
+                    let w = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
+                    if !cfg.host && sig_rx.is_none_or(|r| (w(4).wrapping_sub(r) as i32) > 0) {
+                        sig_rx = Some(w(4));
+                        state::lock(&REMOTE_SIGNALS).push([w(8), w(12), w(16)]);
+                    }
+                } else if n == 20 && buf[..4] == EVENT_MAGIC.to_le_bytes() {
+                    let w = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
+                    // The host only takes objectives the client's player reached: kind 2, DONE.
+                    if !cfg.host || (w(8) == 2 && w(12) == 0x26b8_0d1f) {
+                        state::lock(&REMOTE_EVENTS).push([w(4), w(8), w(12), w(16)]);
+                    }
+                } else if n >= 4 && buf[..4] == SCENE_MAGIC.to_le_bytes() {
+                    if !cfg.host {
+                        *state::lock(&REMOTE_SCENE) = Some(buf[4..n].to_vec()); // validated by the game thread
+                    }
+                } else if let Some((seq, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {
                     let fresh = world_rx_seq.is_none_or(|r: u32| (seq.wrapping_sub(r) as i32) > 0);
                     if !cfg.host && fresh && s.iter().all(|e| sane(&[e.yaw, e.pos.x, e.pos.y, e.pos.z, e.pos.w])) {
                         world_rx_seq = Some(seq);
@@ -226,6 +278,9 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 s.reset();
             }
             *state::lock(&REMOTE_WORLD) = None;
+            *state::lock(&REMOTE_SCENE) = None;
+            sig_rx = None; // a restarted host counts from 1 again
+            state::lock(&REMOTE_SIGNALS).clear();
             state::lock(&REMOTE_DAMAGE).clear();
             REMOTE_READY.store(false, Ordering::Relaxed);
             state::lock(&REMOTE_INPUTS).reset();
@@ -320,6 +375,143 @@ mod tests {
             }
         }
         panic!("no ack from the game in 120 s");
+    }
+
+    /// Enemy sync without a second player, step 1. Plays the client for a game running as host
+    /// (`peer=127.0.0.1:27016`, `host=true`): records 60 s of the game's enemy snapshots to a file.
+    /// `cargo test record_enemies -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn record_enemies_from_running_host() {
+        let sock = UdpSocket::bind("127.0.0.1:27016").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+        let game: SocketAddr = "127.0.0.1:27015".parse().unwrap();
+        let (mut beat, mut seq, mut first) = (Instant::now() - HEARTBEAT, 0, None::<Instant>);
+        let (mut out, mut count, mut buf) = (Vec::new(), 0, [0u8; 2048]);
+        let deadline = Instant::now() + Duration::from_secs(600);
+        while first.is_none_or(|t| t.elapsed() < Duration::from_secs(60)) {
+            assert!(Instant::now() < deadline, "no enemy snapshots in 10 min (game running as host, near enemies?)");
+            if beat.elapsed() >= HEARTBEAT {
+                beat = Instant::now();
+                seq += 1;
+                sock.send_to(&encode(Header { seq, epoch: 0, flags: READY }, &Correction::default(), &[]), game).unwrap();
+            }
+            if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                if let Some((_, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {
+                    let t = *first.get_or_insert_with(|| {
+                        println!("recording {} enemies, 60 s...", s.len());
+                        Instant::now()
+                    });
+                    out.extend_from_slice(&(t.elapsed().as_millis() as u32).to_le_bytes());
+                    out.extend_from_slice(&(n as u32).to_le_bytes());
+                    out.extend_from_slice(&buf[..n]);
+                    count += 1;
+                }
+            }
+        }
+        std::fs::write(enemy_recording(), out).unwrap();
+        println!("saved {count} snapshots to {}", enemy_recording().display());
+    }
+
+    /// Step 2. Plays the host for a game running as client (`peer=127.0.0.1:27016`, `host=false`): replays the
+    /// recording in a loop for 10 min and prints the damage the game reports. Its log shows "N/M host enemies matched".
+    /// `cargo test replay_enemies -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replay_enemies_to_running_client() {
+        let rec = std::fs::read(enemy_recording()).expect("run record_enemies_from_running_host first");
+        let mut packets = Vec::new();
+        let mut at = 0;
+        while at + 8 <= rec.len() {
+            let word = |i: usize| u32::from_le_bytes(rec[i..i + 4].try_into().unwrap());
+            let (ms, n) = (word(at), word(at + 4) as usize);
+            packets.push((Duration::from_millis(ms as u64), &rec[at + 8..at + 8 + n]));
+            at += 8 + n;
+        }
+        let total = packets.last().expect("empty recording").0 + Duration::from_millis(16);
+        let sock = UdpSocket::bind("127.0.0.1:27016").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+        let game: SocketAddr = "127.0.0.1:27015".parse().unwrap();
+        let (start, mut beat, mut seq, mut next, mut lap) = (Instant::now(), Instant::now() - HEARTBEAT, 0, 0, 0u32);
+        let mut buf = [0u8; 2048];
+        while start.elapsed() < Duration::from_secs(600) {
+            if beat.elapsed() >= HEARTBEAT {
+                beat = Instant::now();
+                seq += 1;
+                sock.send_to(&encode(Header { seq, epoch: 0, flags: IS_HOST }, &Correction::default(), &[]), game).unwrap();
+            }
+            // Snapshot seq numbers must keep growing across laps, or the game drops them as old.
+            let t = start.elapsed().saturating_sub(total * lap);
+            if t >= total {
+                lap += 1;
+                next = 0;
+            } else if next < packets.len() && t >= packets[next].0 {
+                let mut p = packets[next].1.to_vec();
+                p[4..8].copy_from_slice(&(lap * packets.len() as u32 + next as u32 + 1).to_le_bytes());
+                sock.send_to(&p, game).unwrap();
+                next += 1;
+            }
+            if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                if let Some((_, d)) = decode_list::<Damage>(DAMAGE_MAGIC, &buf[..n]) {
+                    if !d.is_empty() {
+                        println!("game reports damage: {:?}", d.iter().map(|x| (x.handle, x.total)).collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Quest sync without a second player: run the game as client (`host=false`, `world_sync=true`,
+    /// bind 127.0.0.1:27015, peer 127.0.0.1:27016), load the newest save, then run this. It plays the host and sends
+    /// that save's SceneState list without "Desert_first" for 70 s, then the full list for 70 s: the log should
+    /// show `quest sync: - Desert_first`, then `+ Desert_first`.
+    /// `cargo test --release --target x86_64-pc-windows-msvc fake_host_scene_states -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn fake_host_scene_states() {
+        let dir = save::save_dir().expect("save folder");
+        let newest = (0..3)
+            .filter_map(|n| {
+                let p = dir.join(format!("SlotData_{n}.dat"));
+                Some((std::fs::metadata(&p).ok()?.modified().ok()?, p))
+            })
+            .max()
+            .expect("no save")
+            .1;
+        let text = String::from_utf8_lossy(&std::fs::read(&newest).unwrap()).into_owned();
+        let names: Vec<&str> = text
+            .lines()
+            .skip_while(|l| *l != "SceneState")
+            .skip(1)
+            .take_while(|l| l.starts_with(' '))
+            .map(str::trim)
+            .collect();
+        println!("{}: {} scene states", newest.display(), names.len());
+        let sock = UdpSocket::bind("127.0.0.1:27016").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+        let game: SocketAddr = "127.0.0.1:27015".parse().unwrap();
+        let (start, mut beat, mut list_at, mut seq) = (Instant::now(), Instant::now() - HEARTBEAT, Instant::now(), 0);
+        let mut buf = [0u8; 2048];
+        while start.elapsed() < Duration::from_secs(150) {
+            if beat.elapsed() >= HEARTBEAT {
+                beat = Instant::now();
+                seq += 1;
+                sock.send_to(&encode(Header { seq, epoch: 0, flags: IS_HOST }, &Correction::default(), &[]), game).unwrap();
+            }
+            if start.elapsed() > Duration::from_secs(10) && list_at.elapsed() >= SCENE_EVERY {
+                list_at = Instant::now();
+                let with = start.elapsed() < Duration::from_secs(80);
+                // A real state: the game's set() refuses names it does not know.
+                let l: Vec<&str> = names.iter().copied().filter(|n| !with || *n != "Desert_first").collect();
+                sock.send_to(&[&SCENE_MAGIC.to_le_bytes()[..], l.join("\n").as_bytes()].concat(), game).unwrap();
+                println!("{:>3} s: sent {} states{}", start.elapsed().as_secs(), l.len(), if with { " (without Desert_first)" } else { "" });
+            }
+            let _ = sock.recv_from(&mut buf);
+        }
+    }
+
+    fn enemy_recording() -> std::path::PathBuf {
+        std::env::temp_dir().join("nier_coop_enemies.rec")
     }
     #[test]
     fn packet_roundtrip_and_rejects() {

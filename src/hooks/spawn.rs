@@ -79,7 +79,7 @@ pub fn crc32(s: &[u8]) -> u32 {
 }
 
 /// Native function behind a script function such as "Behavior.setSuspend".
-fn script_fn(name: &str) -> Option<usize> {
+pub(super) fn script_fn(name: &str) -> Option<usize> {
     let head_ptr = ADDR.get()?.scripts as *const *const ScriptFunction;
     let want = crc32(name.as_bytes());
     let head = unsafe { head_ptr.read_volatile() };
@@ -154,6 +154,30 @@ pub fn partner(pl: *mut Pl0000, pl_handle: u32) -> Option<*mut Pl0000> {
         tracing::info!("spawned remote 2B: entity {:#x} behavior {:#x}", e as *mut Entity as usize, b as usize);
         Some(b)
     }
+}
+
+/// Makes the spawned 2B `pl`'s buddy again after the game changed it (same steps as `partner`, no spawn).
+pub fn relink(pl: *mut Pl0000, pl_handle: u32, b: *mut Pl0000, b_handle: u32) -> Option<()> {
+    let (suspend, from_npc) = (script_fn("Behavior.setSuspend")?, script_fn("Pl0000.setBuddyFromNpc")?);
+    type Suspend = unsafe extern "system" fn(*mut Pl0000, i32);
+    type FromNpc = unsafe extern "system" fn(*mut Pl0000);
+    unsafe {
+        let old = addr_of_mut!((*pl).buddy_handle).read();
+        addr_of_mut!((*b).buddy_handle).write(pl_handle);
+        addr_of_mut!((*pl).buddy_handle).write(b_handle);
+        std::mem::transmute::<usize, Suspend>(suspend)(b, 0);
+        if let (Some(a), Some(e)) = (ADDR.get(), super::entity_by_handle(b_handle)) {
+            // A cutscene may have given her buddy AI again: back to the player routine (driven by our inputs).
+            let routine = std::mem::transmute::<usize, unsafe extern "system" fn(*const u8, *mut Entity)>(a.routine);
+            routine(b"PLAYER\0".as_ptr(), e);
+            routine(b"player\0".as_ptr(), e);
+        }
+        addr_of_mut!((*b).obj_flags).write(u32::MAX);
+        std::mem::transmute::<usize, FromNpc>(from_npc)(b);
+        addr_of_mut!((*b).obj_flags).write(0);
+        tracing::info!("re-linked remote 2B as buddy (game had buddy {old:#x}, player {pl_handle:#x})");
+    }
+    Some(())
 }
 
 #[cfg(test)]

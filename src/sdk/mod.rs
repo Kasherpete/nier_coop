@@ -157,7 +157,8 @@ pub const START_ANIMATION_INDEX: usize = 18;
 pub struct Entity {
     _unknown: usize,           // 0x00
     pub name: [u8; 0x20],      // 0x08 NUL-terminated
-    pub flags: u64,            // 0x28
+    pub object_id: u32,        // 0x28 type id: 0x1xxxx pl, 0x2xxxx em (enemy), 0x3xxxx wp, ...
+    _flags: u32,               // 0x2C
     pub handle: u32,           // 0x30
     _pad_34: u32,              // 0x34
     _unknown2: usize,          // 0x38
@@ -178,6 +179,64 @@ const _: () = assert!(size_of::<EntityDescriptor>() == 0x10);
 
 /// The u32 entity count lives this many bytes before the entity-list global.
 pub const ENTITY_COUNT_BEFORE_LIST: usize = 0x10;
+
+/// Interned, refcounted engine string (node of the global string pool, `lib::HashedString`).
+#[repr(C)]
+pub struct HashedStr {
+    _tree: [usize; 4],   // 0x00 pool tree links
+    pub hash: u32,       // 0x20
+    _pad_24: u32,        // 0x24
+    pub text: *const u8, // 0x28 NUL-terminated (inline at 0x38)
+    pub refs: usize,     // 0x30
+}
+const _: () = assert!(size_of::<HashedStr>() == 0x38 && offset_of!(HashedStr, text) == 0x28);
+
+/// One active scene state ("q120/DONE", "Route/A", ...), kept sorted by name hash.
+#[repr(C)]
+pub struct SceneState {
+    _unknown: [usize; 2],     // 0x00
+    pub name: *mut HashedStr, // 0x10
+    _unknown2: usize,         // 0x18
+}
+const _: () = assert!(size_of::<SceneState>() == 0x20);
+
+/// `hap::scene_state::SceneStateSystem`, a static object in the image; only its state array is read.
+#[repr(C)]
+pub struct SceneStateSystem {
+    _unknown: [u8; 0x98],          // 0x00
+    pub states: *const SceneState, // 0x98
+    pub count: usize,              // 0xA0
+}
+const _: () = assert!(offset_of!(SceneStateSystem, count) == 0xA0);
+
+/// Scene action (`hap::Action`): cutscenes (PhaseEventAction), triggers, quest steps placed in the layout.
+#[repr(C)]
+pub struct SceneAction {
+    pub vtable: usize, // 0x00
+    _unknown: [u8; 0x10], // 0x08
+    pub id: u32,       // 0x18 layout id (the save's Scene/Action keys)
+    pub flags: u32,    // 0x1C
+    pub state: u32,    // 0x20 state name hash
+}
+const _: () = assert!(offset_of!(SceneAction, state) == 0x20);
+
+/// A group of scene actions.
+#[repr(C)]
+pub struct ActionGroup {
+    _unknown: [u8; 0x30],              // 0x00
+    pub actions: *const *mut SceneAction, // 0x30
+    pub count: usize,                  // 0x38
+}
+const _: () = assert!(offset_of!(ActionGroup, count) == 0x38);
+
+/// Static object holding every loaded action group (the one the save's Scene/Action section is written from).
+#[repr(C)]
+pub struct ActionScene {
+    _unknown: [u8; 0x48],                // 0x00
+    pub groups: *const *const ActionGroup, // 0x48
+    pub count: usize,                    // 0x50
+}
+const _: () = assert!(offset_of!(ActionScene, count) == 0x50);
 
 pub mod patterns {
     /// `shl rcx,4; add rcx,[rip+disp]` -> global `EntityDescriptor*`. (pattern, disp offset, instruction end)
@@ -207,6 +266,32 @@ pub mod patterns {
     /// Per-character pod-program update (starts/ends pod skills from held bit 4); the engine's caller (0x528c70 in
     /// exe 2026-10-09) returns early for non-player-controlled characters, so it never runs for the remote.
     pub const POD_PROGRAM: &str = "4C 8B DC 57 48 81 EC A0 01 00 00 48 8B 05 ? ? ? ? 48 33 C4 48 89 84 24 50 01 00 00 83 B9 60 5B 01 00 00";
+    /// `SceneStateSystem.set(&sys, &intern(hash(s), s))` on a literal ("Buddy/9S" in exe 2026-10-09), then
+    /// `release(&s)`. From the start: hash call, +0x14 `lea rcx,[pool]`, +0x1B intern call, +0x28 `lea rcx,[sys]`,
+    /// +0x2F set call, +0x39 release call. The first match whose set call goes to the script's set is used.
+    pub const SCENE_SET_SITE: &str = "E8 ? ? ? ? 41 B9 ? 00 00 00 4C 8D 05 ? ? ? ? 8B D0 48 8D 0D ? ? ? ? E8 ? ? ? ? 48 89 45 ? 48 8D 55 ? 48 8D 0D ? ? ? ? E8 ? ? ? ? 90 48 8D 4D ? E8";
+    /// Start of `Action::request_state(this, req)`: returns early when `this->state (0x20) == req->hash`.
+    pub const REQUEST_STATE: &str = "48 89 5C 24 10 57 48 83 EC 30 48 8B D9 48 8B FA 8B 0A 39 4B 20";
+    /// Flag update then `lea rcx,[action_scene]; call save_scene` (+0x14 is the lea).
+    pub const ACTION_SCENE: &str = "8B 05 ? ? ? ? 0F BA F0 1C 0F BA E8 1E 89 05 ? ? ? ? 48 8D 0D ? ? ? ? E8";
+    /// Start of the scene signal queue push, `post(queue, &sender, &signal)` (called at +0x53 in Action.signal).
+    pub const SIGNAL_POST: &str = "48 8B C4 56 57 41 56 48 83 EC 50 48 C7 40 B8 FE FF FF FF 48 89 58 10";
+    /// RTTI type name of the cutscene action class.
+    pub const PHASE_EVENT_RTTI: &str = ".?AVPhaseEventAction@hap@@";
+    /// RTTI type name of the action that sends commands to entities (blow up debris, open doors).
+    pub const SEND_COMMAND_RTTI: &str = ".?AVSendCommand@hap@@";
+    /// RTTI type name of a quest objective (goal marker); its state changes are mirrored.
+    pub const GOAL_RTTI: &str = ".?AVHapGoalLocationAction@hap@@";
+    /// RTTI type name of an area-triggered enemy spawn set; the host's spawn start is mirrored.
+    pub const ENEMY_SET_RTTI: &str = ".?AVEnemySetArea@hap@@";
+    /// `SendCommand` vtable slot that runs its command list, then requests DONE: `run(this, out)`.
+    pub const SEND_COMMAND_RUN: usize = 9;
+    /// `HapGoalLocationAction` vtable slot `update(this)`: in WAIT it sets the HUD objective and map marker, then
+    /// requests ACTIVE (exe 2026-10-09: 0x3e34c0).
+    pub const GOAL_UPDATE: usize = 9;
+    /// `HapGoalLocationAction` vtable slot `finish(this)`: removes its map marker and HUD objective, then requests
+    /// DONE (exe 2026-10-09: 0x3e07f0).
+    pub const GOAL_FINISH: usize = 12;
     /// First bytes at `aim_copy`: `lea rcx,[rdi+0x12800]`.
     pub const AIM_COPY: [u8; 7] = [0x48, 0x8D, 0x8F, 0x00, 0x28, 0x01, 0x00];
 }

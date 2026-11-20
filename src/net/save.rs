@@ -118,7 +118,12 @@ impl SaveSync {
             Some(CHUNK_MAGIC) if !self.host => {
                 if let Some((slot, data)) = self.receive(p) {
                     let crc = crc32(&data);
-                    let same = std::fs::read(self.dir.join(slot_name(slot))).is_ok_and(|d| crc32(&d) == crc);
+                    let mut data = data;
+                    match own_steam_id(&self.dir) {
+                        Some(id) => set_owner(&mut data, id),
+                        None => tracing::warn!("save sync: own Steam ID not found (no GameData.dat?); the slot may show as empty"),
+                    }
+                    let same = std::fs::read(self.dir.join(slot_name(slot))).is_ok_and(|d| d == data);
                     let result = if same { Ok(()) } else { self.write(slot, &data) };
                     if result.is_ok() {
                         crate::hooks::savefile::SAVE_READY.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -200,12 +205,30 @@ impl SaveSync {
     }
 }
 
+/// Steam IDs are 64-bit with this fixed high word for individual accounts (bytes 4..8 little-endian).
+const STEAM_ID_HIGH: [u8; 4] = [0x01, 0x00, 0x10, 0x01];
+
+/// This player's SteamID64, from the first 8 bytes of their own GameData.dat (the game writes it there).
+fn own_steam_id(dir: &std::path::Path) -> Option<[u8; 8]> {
+    let g = std::fs::read(dir.join("GameData.dat")).ok()?;
+    let id: [u8; 8] = g.get(..8)?.try_into().ok()?;
+    (id[4..] == STEAM_ID_HIGH).then_some(id)
+}
+
+/// Each slot stores its owner's SteamID64 at byte 4 (seen in the Steam saves); the game shows a slot with
+/// another player's ID as empty, so the host's save gets this player's ID.
+fn set_owner(data: &mut [u8], id: [u8; 8]) {
+    if data.get(8..12) == Some(&STEAM_ID_HIGH[..]) {
+        data[4..12].copy_from_slice(&id);
+    }
+}
+
 fn slot_name(slot: u32) -> String {
     format!("SlotData_{slot}.dat")
 }
 
 /// Documents\My Games\NieR_Automata, through the shell so a OneDrive-moved Documents folder is found.
-fn save_dir() -> Option<PathBuf> {
+pub(super) fn save_dir() -> Option<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{FOLDERID_Documents, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
     let docs = unsafe {
@@ -275,6 +298,18 @@ mod tests {
     }
 
     #[test]
+    fn owner_id_swapped() {
+        let host = [0, 0, 0, 0, 0x68, 0x8F, 0x66, 0x5B, 1, 0, 0x10, 1, 0x54, 0x59];
+        let mine = [0x11, 0x22, 0x33, 0x44, 1, 0, 0x10, 1];
+        let mut d = host.to_vec();
+        set_owner(&mut d, mine);
+        assert_eq!(d, [0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 1, 0, 0x10, 1, 0x54, 0x59]);
+        let mut odd = vec![0u8; 14]; // no Steam ID where expected: left alone
+        set_owner(&mut odd, mine);
+        assert_eq!(odd, vec![0u8; 14]);
+    }
+
+    #[test]
     fn assembles_out_of_order_and_rejects_bad() {
         let data: Vec<u8> = (0..235_980u32).map(|i| (i * 7) as u8).collect();
         let mut s = SaveSync { host: false, dir: PathBuf::new(), out: None, inc: None, written: None, checked: Instant::now(), sent: Instant::now() };
@@ -306,5 +341,86 @@ mod tests {
         let mut c = chunks(0, &data);
         c[1][HEAD] ^= 1;
         assert_eq!(c.iter().filter_map(|p| s.receive(p)).count(), 0);
+    }
+
+    /// Quest sync groundwork, run with the game in-game: where does the running game keep the newest save in memory?
+    /// Samples 32-byte windows of SlotData_N.dat, finds them in the game's memory, and prints the biggest runs as
+    /// file offset range -> address (exe-relative when inside the exe). Quest flags live somewhere in that image.
+    /// `cargo test --release --target x86_64-pc-windows-msvc map_save_in_running_game -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn map_save_in_running_game() {
+        use std::collections::HashMap;
+        use windows::Win32::Foundation::{CloseHandle, HMODULE};
+        use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx};
+        use windows::Win32::System::ProcessStatus::EnumProcessModules;
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+
+        let dir = save_dir().expect("save folder");
+        let (path, data) = (0..3)
+            .filter_map(|n| {
+                let p = dir.join(slot_name(n));
+                Some((std::fs::metadata(&p).ok()?.modified().ok()?, p))
+            })
+            .max()
+            .map(|(_, p)| (p.clone(), std::fs::read(&p).unwrap()))
+            .expect("no SlotData_N.dat");
+        println!("{} ({} bytes)", path.display(), data.len());
+        // Windows with >= 12 distinct bytes, keyed by their first 8 bytes.
+        const W: usize = 32;
+        let mut keys: HashMap<u64, Vec<usize>> = HashMap::new();
+        for off in (0..data.len().saturating_sub(W)).step_by(16) {
+            let w = &data[off..off + W];
+            if w.iter().collect::<std::collections::HashSet<_>>().len() >= 12 {
+                keys.entry(u64::from_le_bytes(w[..8].try_into().unwrap())).or_default().push(off);
+            }
+        }
+        println!("{} sample windows", keys.values().map(Vec::len).sum::<usize>());
+
+        let out = std::process::Command::new("tasklist").args(["/FI", "IMAGENAME eq NieRAutomata.exe", "/FO", "CSV", "/NH"]).output().unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).split(',').nth(1).expect("game not running").trim_matches('"').parse().unwrap();
+        let h = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.unwrap();
+        let mut m = [HMODULE::default(); 1];
+        let mut need = 0;
+        unsafe { EnumProcessModules(h, m.as_mut_ptr(), size_of_val(&m) as u32, &mut need) }.unwrap();
+        let exe = m[0].0 as usize;
+
+        // delta = address - file offset; one save image in memory = many hits with the same delta.
+        let mut hits: HashMap<isize, Vec<usize>> = HashMap::new();
+        let (mut addr, mut buf) = (0usize, Vec::new());
+        loop {
+            let mut mi = MEMORY_BASIC_INFORMATION::default();
+            if unsafe { VirtualQueryEx(h, Some(addr as _), &mut mi, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+                break;
+            }
+            let (base, size) = (mi.BaseAddress as usize, mi.RegionSize);
+            addr = base + size;
+            if mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)).0 != 0 || size > 1 << 30 {
+                continue;
+            }
+            buf.resize(size, 0);
+            let mut got = 0;
+            if unsafe { ReadProcessMemory(h, base as _, buf.as_mut_ptr().cast(), size, Some(&mut got)) }.is_err() {
+                continue;
+            }
+            for i in (0..got.saturating_sub(W)).step_by(4) {
+                let Some(offs) = keys.get(&u64::from_le_bytes(buf[i..i + 8].try_into().unwrap())) else { continue };
+                for &off in offs {
+                    if buf[i..i + W] == data[off..off + W] {
+                        hits.entry((base + i) as isize - off as isize).or_default().push(off);
+                    }
+                }
+            }
+        }
+        unsafe { CloseHandle(h) }.unwrap();
+        let mut runs: Vec<_> = hits.into_iter().filter(|(_, v)| v.len() >= 8).collect();
+        runs.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        for (delta, offs) in runs.iter().take(10) {
+            let (lo, hi) = (*offs.iter().min().unwrap(), *offs.iter().max().unwrap() + W);
+            let a = (*delta + lo as isize) as usize;
+            let at = if a >= exe && a < exe + 0x1000_0000 { format!("exe+{:#x}", a - exe) } else { format!("{a:#x} (heap)") };
+            println!("file {lo:#x}..{hi:#x} ({} windows) at {at}", offs.len());
+        }
     }
 }

@@ -23,6 +23,8 @@ mod lockstep;
 pub mod savefile;
 mod spawn;
 pub(crate) use spawn::crc32;
+mod events;
+mod quest;
 mod world;
 
 static_detour! {
@@ -59,6 +61,20 @@ pub static SPAWN_2B: AtomicBool = AtomicBool::new(false);
 static SPAWNED: AtomicU32 = AtomicU32::new(0);
 /// Ticks until the next spawn attempt, so a failing spawn is not retried every frame.
 static SPAWN_WAIT: AtomicU32 = AtomicU32::new(0);
+/// Frames the peer's health has been 0; u32::MAX until the peer is seen alive (and again after each follow-death).
+static PEER_DEAD_FRAMES: AtomicU32 = AtomicU32::new(u32::MAX);
+const PEER_DEAD_HOLD: u32 = 120; // ~2 s at 0 hp: a real death, not a 1-frame revive
+/// Local player present with health > 0 last tick; its edges reset world sync and bring the spawned 2B back.
+static LOCAL_ALIVE: AtomicBool = AtomicBool::new(false);
+
+/// Next `PEER_DEAD_FRAMES` value for the peer's current health.
+fn peer_dead_step(frames: u32, hp: u32) -> u32 {
+    match (hp, frames) {
+        (1.., _) => 0,
+        (0, u32::MAX) => u32::MAX,
+        (0, n) => n + 1,
+    }
+}
 
 pub fn install() -> Result<(), String> {
     let m = scan::module().ok_or("could not read game module")?;
@@ -101,6 +117,14 @@ pub fn install() -> Result<(), String> {
     match scan::parse(patterns::POD_PROGRAM).and_then(|p| scan::find_unique(m, &p)) {
         Some(at) => POD_PROGRAM_FN.store(base + at, Relaxed),
         None => tracing::error!("POD_PROGRAM not found; the remote's pod skill stays off"),
+    }
+    if crate::state::WORLD_SYNC.load(Relaxed) {
+        if let Err(e) = events::install(m, base) {
+            tracing::error!("event log off: {e}");
+        }
+    }
+    if let Err(e) = quest::install(m, base) {
+        tracing::error!("quest sync off: {e}");
     }
     if let Err(e) = install_free_aim(m, base) {
         tracing::error!("free-aim pod hook: {e}"); // her pod then only fires at entities near the aim point
@@ -336,6 +360,19 @@ extern "system" fn on_tick() {
             unsafe { addr_of_mut!((*b).health).write(c.hp.max(1)) };
         }
     }
+    // Death or respawn (checkpoint reload, area load): the host re-sends every enemy and the client re-pairs them,
+    // and on respawn the spawned 2B comes back at once next to the player instead of after the 5 s retry.
+    let alive = pl.is_some_and(|p| unsafe { addr_of_mut!((*p).health).read() } > 0);
+    if LOCAL_ALIVE.swap(alive, Relaxed) != alive {
+        tracing::info!("local player {}: resetting world sync", if alive { "respawned" } else { "died or unloaded" });
+        world::reset();
+        if alive {
+            SPAWN_WAIT.store(0, Relaxed);
+            if let (Some(b), Some(p)) = (spawned, pl) {
+                unsafe { addr_of_mut!((*b).position).write(addr_of_mut!((*p).position).read()) };
+            }
+        }
+    }
     LOCAL_READY.store(pl.is_some(), Relaxed);
     let ls_frame = if LOCKSTEP.load(Relaxed) { lockstep::step_clock(pl.is_some()) } else { None };
     let Some(pl) = pl else {
@@ -343,6 +380,15 @@ extern "system" fn on_tick() {
         return;
     };
     hook_start_animation(pl);
+    // The peer died: its game reloads the last checkpoint, so die too and reload the same one (else the two worlds split).
+    if let (Some(c), true) = (*state::lock(&REMOTE_CORRECTION), REMOTE_ACTIVE.load(Relaxed)) {
+        let n = peer_dead_step(PEER_DEAD_FRAMES.load(Relaxed), c.hp);
+        if n == PEER_DEAD_HOLD {
+            tracing::info!("partner died: killing the local player to restart at the same checkpoint");
+            unsafe { addr_of_mut!((*pl).health).write(0) };
+        }
+        PEER_DEAD_FRAMES.store(if n >= PEER_DEAD_HOLD { u32::MAX } else { n }, Relaxed);
+    }
     let wait = SPAWN_WAIT.load(Relaxed);
     SPAWN_WAIT.store(wait.saturating_sub(1), Relaxed);
     if REMOTE_ACTIVE.load(Relaxed) && SPAWN_2B.load(Relaxed) && spawned.is_none() && wait == 0 {
@@ -352,10 +398,21 @@ extern "system" fn on_tick() {
         if spawn::partner(pl, h).is_some() {
             SPAWNED.store(unsafe { addr_of_mut!((*pl).buddy_handle).read() }, Relaxed);
         }
+    } else if let Some(b) = spawned.filter(|_| wait == 0) {
+        // Cutscenes suspend her, give her buddy AI back or hand the player another buddy without removing her: she
+        // then stands frozen or hidden. Set her up again after each cutscene, and whenever the buddy link breaks.
+        let (h, mine) = (unsafe { (POSSESSED.load(Relaxed) as *const u32).read_volatile() }, SPAWNED.load(Relaxed));
+        let broken = unsafe { addr_of_mut!((*pl).buddy_handle).read() != mine || addr_of_mut!((*b).buddy_handle).read() != h };
+        if broken || events::EVENT_ENDED.swap(false, Relaxed) {
+            SPAWN_WAIT.store(if broken { 300 } else { 60 }, Relaxed);
+            spawn::relink(pl, h, b, mine);
+        }
     }
     let buddy = unsafe { entity_by_handle(addr_of_mut!((*pl).buddy_handle).read()) }.and_then(as_pl0000);
     BUDDY.store(buddy.map_or(0, |b| b as usize), Relaxed);
     world::tick(pl);
+    quest::tick();
+    events::tick();
 
     // Record this frame's input (sent every frame) and current state (for drift correction).
     // In lockstep the frame number is the shared lockstep frame and carries a world checksum.
@@ -406,7 +463,8 @@ extern "system" fn on_tick() {
         None if LOCKSTEP.load(Relaxed) => return, // stopped (waiting for the peer): nothing to apply
         None => None,
     };
-    if let (Some(b), true) = (buddy, REMOTE_ACTIVE.load(Relaxed)) {
+    // Her, even while the game has handed the player another buddy (relinked within ~5 s).
+    if let (Some(b), true) = (spawned.or(buddy), REMOTE_ACTIVE.load(Relaxed)) {
         // One remote frame per local frame; with none buffered, keep the stick and held buttons but press nothing new.
         let next = match remote {
             Some(r) => r,
@@ -604,6 +662,12 @@ fn apply_input(b: *mut Pl0000, f: &InputFrame) {
 const CORRECT_DIST: f32 = 1.0;
 /// Past this distance (m) she is teleported (area load, respawn, long stall).
 const SNAP_DIST: f32 = 10.0;
+/// Still this far off (m) after `STUCK_FRAMES` frames of pulling: something blocks her here only (debris that
+/// is gone on the peer's side), so she is teleported.
+const STUCK_DIST: f32 = 3.0;
+const STUCK_FRAMES: u32 = 60;
+static STUCK: AtomicU32 = AtomicU32::new(0);
+static SNAPS: AtomicU32 = AtomicU32::new(0);
 /// Past this yaw error (rad) her rotation is set to the peer's.
 const CORRECT_YAW: f32 = 0.5;
 
@@ -613,8 +677,19 @@ fn correct_drift(b: *mut Pl0000, c: &Correction) {
         let pos = addr_of_mut!((*b).position);
         let (p, t) = (pos.read(), c.pos);
         let d = ((t.x - p.x).powi(2) + (t.y - p.y).powi(2) + (t.z - p.z).powi(2)).sqrt();
-        if d > SNAP_DIST {
+        let stuck = if d > STUCK_DIST {
+            STUCK.fetch_add(1, Relaxed) + 1
+        } else {
+            STUCK.store(0, Relaxed);
+            0
+        };
+        if d > SNAP_DIST || stuck > STUCK_FRAMES {
+            STUCK.store(0, Relaxed);
             pos.write(t);
+            // Snaps every frame mean the game ignores her position (she stands frozen on screen).
+            if SNAPS.fetch_add(1, Relaxed) % 120 == 0 {
+                tracing::info!("partner snapped {d:.1} m to ({:.1}, {:.1}, {:.1}), now at {:?}", t.x, t.y, t.z, pos.read().x);
+            }
         } else if d > CORRECT_DIST {
             let k = 0.2;
             pos.write(cVec4 { x: p.x + (t.x - p.x) * k, y: p.y + (t.y - p.y) * k, z: p.z + (t.z - p.z) * k, w: t.w });
@@ -644,6 +719,16 @@ fn yaw_error(a: f32, b: f32) -> f32 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn peer_dead_needs_alive_first() {
+        use super::peer_dead_step as s;
+        assert_eq!(s(u32::MAX, 0), u32::MAX); // never seen alive (not in game yet): stay disarmed
+        assert_eq!(s(u32::MAX, 50), 0);
+        assert_eq!(s(0, 0), 1);
+        assert_eq!(s(7, 0), 8);
+        assert_eq!(s(7, 1), 0); // revived: count restarts
+    }
+
     #[test]
     fn yaw_error_wraps() {
         use std::f32::consts::PI;

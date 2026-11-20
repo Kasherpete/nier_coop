@@ -52,11 +52,14 @@ pub fn find_ref(hay: &[u8], target: usize) -> Option<usize> {
     (0..hay.len().saturating_sub(4)).find(|&i| rip_target(hay, i, 0, 4) == Some(target))
 }
 
+/// Whether `pat` matches `hay` at `i`.
+pub fn matches_at(hay: &[u8], i: usize, pat: &[Option<u8>]) -> bool {
+    hay.get(i..i + pat.len()).is_some_and(|w| w.iter().zip(pat).all(|(b, p)| p.is_none_or(|p| p == *b)))
+}
+
 /// Offset of the closest match of `pat` that starts in `[end - max, end)`.
 pub fn rfind(hay: &[u8], end: usize, max: usize, pat: &[Option<u8>]) -> Option<usize> {
-    (end.saturating_sub(max)..end).rev().find(|&i| {
-        hay.get(i..i + pat.len()).is_some_and(|w| w.iter().zip(pat).all(|(b, p)| p.is_none_or(|p| p == *b)))
-    })
+    (end.saturating_sub(max)..end).rev().find(|&i| matches_at(hay, i, pat))
 }
 
 #[cfg(test)]

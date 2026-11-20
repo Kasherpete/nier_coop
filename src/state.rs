@@ -159,6 +159,20 @@ pub static REMOTE_WORLD: Mutex<Option<(std::time::Instant, Vec<EnemyState>)>> = 
 pub static LOCAL_DAMAGE: Mutex<Vec<Damage>> = Mutex::new(Vec::new());
 pub static REMOTE_DAMAGE: Mutex<Vec<Damage>> = Mutex::new(Vec::new());
 
+/// Quest sync: the host's scene state names, newline-separated (game thread writes, net sends every second).
+/// Client: the newest list received, taken by the game thread when applied.
+pub static LOCAL_SCENE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+pub static REMOTE_SCENE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Cutscene sync: [action id, kind, state hash, state flag] the host just ran (game thread pushes, net sends), and
+/// those received. Kind 0: a cutscene started playing; 1: a SendCommand ran its commands (debris blown up, doors
+/// opened); 2: a quest objective (HapGoalLocationAction) changed state.
+pub static LOCAL_EVENTS: Mutex<Vec<[u32; 4]>> = Mutex::new(Vec::new());
+pub static REMOTE_EVENTS: Mutex<Vec<[u32; 4]>> = Mutex::new(Vec::new());
+/// Signal sync: scene signals the host posted, [sender action id, signal hash, arg] (game -> net, net -> game).
+pub static LOCAL_SIGNALS: Mutex<Vec<[u32; 3]>> = Mutex::new(Vec::new());
+pub static REMOTE_SIGNALS: Mutex<Vec<[u32; 3]>> = Mutex::new(Vec::new());
+
 /// Locks ignoring poison: a panic elsewhere must not stop the game thread (values are plain data).
 pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())

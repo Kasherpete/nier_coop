@@ -20,6 +20,8 @@ const STALE: Duration = Duration::from_millis(500);
 /// Past this distance (m) a client enemy is teleported to the host's position, else pulled by `PULL` per frame.
 const SNAP_DIST: f32 = 10.0;
 const PULL: f32 = 0.5;
+/// A host enemy is paired with our nearest unpaired enemy of the same type within this distance (m).
+const MATCH_DIST: f32 = 30.0;
 
 #[derive(Default)]
 struct World {
@@ -27,7 +29,9 @@ struct World {
     applied: HashMap<u32, u32>, // host: damage total already applied per handle
     written: HashMap<u32, u32>, // client: hp we wrote last frame per handle
     dealt: HashMap<u32, u32>,   // client: damage total dealt per handle
+    paired: HashMap<u32, u32>,  // client: host handle -> our handle (each game numbers its objects itself)
     logged: bool,
+    frames: u32, // host: frames with no enemy found, for the one-time name dump
 }
 static WORLD: Mutex<Option<World>> = Mutex::new(None);
 
@@ -41,27 +45,34 @@ pub fn tick(pl: *mut Pl0000) {
     if HOST.load(Relaxed) { host(w, pl) } else { client(w) }
 }
 
-/// Synced objects only: enemies ("em" + id names), never a `Pl0000` (players, buddy). Writing health to an object
-/// that is not a BehaviorAppBase would corrupt it, so the name filter is the safety check.
+/// Synced objects only: enemies (type id 0x2xxxx), never a `Pl0000` (players, buddy). Writing health to an object
+/// that is not a BehaviorAppBase would corrupt it, so the type filter is the safety check. Returns the type id as kind.
 fn enemy(handle: u32, kind: Option<u32>) -> Option<(*mut Pl0000, u32)> {
     let e = entity_by_handle(handle)?;
-    let name = unsafe { addr_of_mut!((*e).name).read() };
+    let k = unsafe { addr_of_mut!((*e).object_id).read() };
     let b = unsafe { addr_of_mut!((*e).behavior).read() };
     let vt = unsafe { b.as_ref()? }.vtable as usize;
-    let k = name_hash(&name);
     let pl = PL_VTABLE.load(Relaxed);
-    // shortcut: a game vtable + "em" name is the type check; an allowlist of enemy vtables would be stricter, add one if a non-Behavior "em*" object shows up.
-    let ok = pl != 0 && vt != pl && in_module(vt) && name.starts_with(b"em");
+    // shortcut: a game vtable + enemy type id is the type check; an allowlist of enemy vtables would be stricter, add one if a non-Behavior 0x2xxxx object shows up.
+    let ok = pl != 0 && vt != pl && in_module(vt) && k >> 16 == 2;
     (ok && kind.is_none_or(|x| x == k)).then_some((b, k))
 }
 
-fn name_hash(name: &[u8]) -> u32 {
-    name.iter().take_while(|&&c| c != 0).fold(0x811C_9DC5, |h, &c| (h ^ c as u32).wrapping_mul(0x0100_0193))
+/// Local death or respawn: forget every pairing and damage total, so the host sends all enemies fresh and no old
+/// damage total lands on a reloaded enemy that got a reused handle.
+pub fn reset() {
+    *state::lock(&WORLD) = None;
+    state::lock(&LOCAL_WORLD).clear();
+    state::lock(&LOCAL_DAMAGE).clear();
+    state::lock(&REMOTE_DAMAGE).clear();
 }
 
 fn host(w: &mut World, pl: *mut Pl0000) {
-    // The client's hits, as totals: apply only what is new since the last packet.
+    // The client's hits, as totals: apply only what is new since the last packet, and only to enemies sent since the last reset.
     for d in std::mem::take(&mut *state::lock(&REMOTE_DAMAGE)) {
+        if !w.seen.contains(&d.handle) {
+            continue;
+        }
         let Some((b, _)) = enemy(d.handle, None) else { continue };
         let last = w.applied.entry(d.handle).or_insert(0);
         if d.total > *last {
@@ -89,6 +100,24 @@ fn host(w: &mut World, pl: *mut Pl0000) {
     if !w.logged && !snap.is_empty() {
         w.logged = true;
         tracing::info!("world sync (host): sending {} enemies", snap.len());
+    } else if !w.logged {
+        w.frames += 1;
+        if w.frames % 1800 == 0 && w.frames <= 1800 * 5 {
+            // Every ~30 s (5 times) with no "em*" enemy found: dump each distinct name, so the filter can be fixed.
+            let mut names = Vec::new();
+            for_each_object(|handle, b, _| {
+                let Some(e) = entity_by_handle(handle) else { return };
+                let name = unsafe { addr_of_mut!((*e).name).read() };
+                let vt = unsafe { b.as_ref() }.map_or(0, |o| o.vtable as usize);
+                let n = String::from_utf8_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())]).into_owned();
+                let id = unsafe { addr_of_mut!((*e).object_id).read() };
+                let s = format!("{n}#{id:x}(vt+{:#x})",vt.wrapping_sub(super::MODULE.get().map_or(0, |m| m.as_ptr() as usize)));
+                if !names.contains(&s) {
+                    names.push(s);
+                }
+            });
+            tracing::warn!("world sync (host): no enemies found; objects here: {}", names.join(" "));
+        }
     }
     *state::lock(&LOCAL_WORLD) = snap;
 }
@@ -98,9 +127,31 @@ fn client(w: &mut World) {
         Some((at, s)) if at.elapsed() < STALE => s.clone(),
         _ => return,
     };
+    w.paired.retain(|_, ours| enemy(*ours, None).is_some());
+    let mut free: Vec<(u32, u32, cVec4)> = Vec::new(); // our unpaired enemies: handle, kind, position
+    if snap.iter().any(|e| !w.paired.contains_key(&e.handle)) {
+        for_each_object(|h, _, pos| {
+            if let Some((_, k)) = enemy(h, None) {
+                if !w.paired.values().any(|&o| o == h) {
+                    free.push((h, k, pos));
+                }
+            }
+        });
+    }
     let mut matched = 0;
     for e in &snap {
-        let Some((b, _)) = enemy(e.handle, Some(e.kind)) else { continue };
+        if !w.paired.contains_key(&e.handle) {
+            // Pair with our nearest unpaired enemy of the same type.
+            let best = free
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.1 == e.kind && dist2(f.2, e.pos) < MATCH_DIST * MATCH_DIST)
+                .min_by(|a, b| dist2(a.1.2, e.pos).total_cmp(&dist2(b.1.2, e.pos)))
+                .map(|(i, _)| i);
+            let Some(i) = best else { continue };
+            w.paired.insert(e.handle, free.swap_remove(i).0);
+        }
+        let Some((b, _)) = enemy(w.paired[&e.handle], Some(e.kind)) else { continue };
         matched += 1;
         unsafe {
             let hp = addr_of_mut!((*b).health);
@@ -113,7 +164,8 @@ fn client(w: &mut World) {
             addr_of_mut!((*b).rotation.y).write(e.yaw);
         }
     }
-    if !w.logged {
+    w.frames += 1;
+    if !w.logged || w.frames % 600 == 0 {
         w.logged = true;
         tracing::info!("world sync (client): {matched}/{} host enemies matched here", snap.len());
     }
@@ -154,9 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn names_and_pull() {
-        assert_eq!(name_hash(b"em1000\0junk"), name_hash(b"em1000"));
-        assert_ne!(name_hash(b"em1000"), name_hash(b"em1001"));
+    fn pull_and_snap() {
         let o = cVec4::default();
         assert_eq!(pull(o, cVec4 { x: 2.0, ..o }).x, 1.0);
         assert_eq!(pull(o, cVec4 { x: 20.0, ..o }).x, 20.0);

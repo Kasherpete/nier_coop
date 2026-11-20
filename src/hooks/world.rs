@@ -206,6 +206,19 @@ mod tests {
     }
 
     #[test]
+    fn reset_forgets_pairings_and_damage() {
+        let mut w = World::default();
+        w.seen.insert(1);
+        w.paired.insert(1, 2);
+        *state::lock(&WORLD) = Some(w);
+        state::lock(&LOCAL_DAMAGE).push(Damage { handle: 1, total: 5 });
+        state::lock(&REMOTE_DAMAGE).push(Damage { handle: 1, total: 5 });
+        reset();
+        assert!(state::lock(&WORLD).is_none()); // host re-sends every enemy, client re-pairs
+        assert!(state::lock(&LOCAL_DAMAGE).is_empty() && state::lock(&REMOTE_DAMAGE).is_empty()); // no old totals on reused handles
+    }
+
+    #[test]
     fn pull_and_snap() {
         let o = cVec4::default();
         assert_eq!(pull(o, cVec4 { x: 2.0, ..o }).x, 1.0);

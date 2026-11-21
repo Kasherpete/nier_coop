@@ -1,9 +1,9 @@
-# nier_coop
+# nier_coop  
 
 Experimental two-player co-op mod for NieR:Automata (Steam). A DLL injected into the game spawns a second 2B
 driven by the other player's inputs over UDP.
 
-> **Made entirely with Claude.** All of the code, reverse engineering and documentation in this repository was
+>  **Made entirely with Claude.** All of the code, reverse engineering and documentation in this repository was
 > written by [Claude](https://claude.com/claude-code) (Anthropic's AI, via Claude Code), directed and tested
 > in-game by a human.
 
@@ -14,6 +14,32 @@ is invincible and respawns after area loads. Flight-unit sections are not suppor
 for details.
 
 ## Build
+
+Requirements:
+
+- [Rust](https://rustup.rs) (the nightly toolchain pinned in `rust-toolchain.toml` is installed automatically).
+
+- The Microsoft C++ build tools, which provide the MSVC linker (`link.exe`). VS Code is not enough. Install
+
+Visual Studio 2022 Build Tools with the C++ workload:
+
+  
+```
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+
+```
+
+  
+
+Or run the [Build Tools installer](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and pick
+
+"Desktop development with C++".
+
+  
+
+Then build:
+
+  
 
 ```
 cargo build --release --target x86_64-pc-windows-msvc

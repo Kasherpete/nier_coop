@@ -29,6 +29,10 @@ const EVENT_MAGIC: u32 = u32::from_le_bytes(*b"NCEV");
 /// Host -> client: a scene signal, [magic, seq, sender id, hash, arg]; sent 3 times, the client keeps new seqs only.
 const SIGNAL_MAGIC: u32 = u32::from_le_bytes(*b"NCSG");
 
+/// Both ways, every second: [magic, this build's version text], so different builds say so instead of failing silently.
+const VERSION_MAGIC: u32 = u32::from_le_bytes(*b"NCVR");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const MAGIC: u32 = u32::from_le_bytes(*b"NCO3");
 const HEADER: usize = 16; // magic u32, seq u32, epoch u32, flags u32
 const FRAMES_AT: usize = HEADER + size_of::<Correction>();
@@ -124,6 +128,8 @@ fn run(cfg: &Config) -> std::io::Result<()> {
     let mut warned_hosts = false;
     let mut world_rx_seq = None::<u32>;
     let mut scene_at = Instant::now();
+    let mut version_at = Instant::now() - SCENE_EVERY;
+    let (mut peer_version, mut warned_layout) = (None::<String>, false);
     let (mut sig_tx, mut sig_rx) = (0u32, None::<u32>);
     // shortcut: one datagram per scene list (~1-4 KB, IP-fragmented); split it if late-game lists outgrow 64 KB.
     let mut buf = vec![0u8; 65536];
@@ -184,6 +190,10 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 sock.send_to(&[&SCENE_MAGIC.to_le_bytes()[..], &names].concat(), peer)?;
             }
         }
+        if version_at.elapsed() >= SCENE_EVERY {
+            version_at = Instant::now();
+            sock.send_to(&[&VERSION_MAGIC.to_le_bytes()[..], VERSION.as_bytes()].concat(), peer)?;
+        }
         match sock.recv_from(&mut buf) {
             // Only the configured peer's IP is trusted; anything else is dropped.
             // A new port is learned only between sessions, so another program on the peer's IP cannot take over one.
@@ -200,7 +210,16 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 }
                 // Scene signals/events/names, like saves, only inside a live session (never as a first packet).
                 let live = REMOTE_ACTIVE.load(Ordering::Relaxed);
-                if n == 20 && buf[..4] == SIGNAL_MAGIC.to_le_bytes() {
+                if let Some(v) = decode_version(&buf[..n]) {
+                    if peer_version.as_deref() != Some(v) {
+                        if v == VERSION {
+                            tracing::info!("peer runs nier_coop v{v} (same as you)");
+                        } else {
+                            tracing::warn!("VERSION MISMATCH: peer runs nier_coop v{v}, you run v{VERSION}. Both install the same zip.");
+                        }
+                        peer_version = Some(v.to_string());
+                    }
+                } else if n == 20 && buf[..4] == SIGNAL_MAGIC.to_le_bytes() {
                     let w = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
                     if live && !cfg.host && sig_rx.is_none_or(|r| (w(4).wrapping_sub(r) as i32) > 0) {
                         sig_rx = Some(w(4));
@@ -264,6 +283,10 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                     if !REMOTE_ACTIVE.swap(true, Ordering::Relaxed) {
                         tracing::info!("connected to {from}");
                     }
+                } else if !warned_layout && n >= 4 && buf[..3] == *b"NCO" && buf[..4] != MAGIC.to_le_bytes() {
+                    // An input packet with another layout tag (NCO2, NCO4...): older builds send no NCVR.
+                    warned_layout = true;
+                    tracing::warn!("VERSION MISMATCH: peer's input packets are from another nier_coop build (you run v{VERSION}). Both install the same zip.");
                 }
             }
             Ok(_) => {}
@@ -276,6 +299,7 @@ fn run(cfg: &Config) -> std::io::Result<()> {
             rx_seq = None; // a restarted peer counts from 1 again
             rx_epoch = None;
             world_rx_seq = None;
+            peer_version = None; // the peer may come back with another build
             if let Some(s) = saves.as_mut() {
                 s.reset();
             }
@@ -327,6 +351,12 @@ fn decode_list<T: bytemuck::Pod>(magic: u32, p: &[u8]) -> Option<(u32, Vec<T>)> 
     Some((word(4)?, p[12..].chunks_exact(size_of::<T>()).map(bytemuck::pod_read_unaligned).collect()))
 }
 
+/// Trust boundary: magic, then 1-32 printable ASCII characters (the text goes into the log).
+fn decode_version(p: &[u8]) -> Option<&str> {
+    let v = p.strip_prefix(&VERSION_MAGIC.to_le_bytes()[..])?;
+    (!v.is_empty() && v.len() <= 32 && v.iter().all(u8::is_ascii_graphic)).then(|| std::str::from_utf8(v).ok())?
+}
+
 fn sane(v: &[f32]) -> bool {
     v.iter().all(|f| f.is_finite() && f.abs() < 1.0e6)
 }
@@ -349,6 +379,17 @@ pub fn decode(p: &[u8]) -> Option<(Header, Correction, [InputFrame; REDUNDANCY])
 mod tests {
     use super::*;
     use crate::sdk::cVec4;
+
+    #[test]
+    fn version_packet() {
+        let m = VERSION_MAGIC.to_le_bytes();
+        assert_eq!(decode_version(&[&m[..], VERSION.as_bytes()].concat()), Some(VERSION));
+        assert_eq!(decode_version(&[&m[..], b"0.0.9"].concat()), Some("0.0.9"));
+        assert_eq!(decode_version(&m), None); // empty
+        assert_eq!(decode_version(&[&m[..], b"1\n2"].concat()), None); // control char
+        assert_eq!(decode_version(&[&m[..], &[b'1'; 33][..]].concat()), None); // too long
+        assert_eq!(decode_version(b"NCO3\x01\x00"), None);
+    }
 
     /// Plays the host for a game running as client (`bind=127.0.0.1:27015`, `peer=127.0.0.1:27016`,
     /// `save_sync=true`): heartbeats plus this PC's newest save, until the game acks it.

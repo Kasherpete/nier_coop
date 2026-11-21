@@ -19,6 +19,7 @@ Install (both players)
    and the other player shows up as a second 2B.
 
 Not connecting?
+- Log says "VERSION MISMATCH"? You have different builds: both install the same zip.
 - Usually works without router setup. If not, the easiest fix: both install Tailscale
   (tailscale.com, free), sign in, and run Install.bat again using the 100.x.x.x IP Tailscale shows.
 - Or the host forwards UDP port 27015 on their router to their PC.

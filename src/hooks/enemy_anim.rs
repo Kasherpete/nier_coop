@@ -21,6 +21,8 @@ struct Hooks {
     last: HashMap<usize, ([u32; 4], u32)>, // host: object -> last call args, call count
     blocked: HashSet<usize>,               // client: paired objects whose own AI may not start animations
     known: HashSet<(usize, [u32; 4])>,     // (vtable, args) this game's own enemies called: the replay allowlist
+    dropped: HashSet<(usize, u32)>,        // client: (vtable, action id) replays refused so far (logged once each)
+    full_logged: bool,
 }
 /// Allowlist cap, so a long session cannot grow it without bound.
 const MAX_KNOWN: usize = 8192;
@@ -85,9 +87,23 @@ pub fn last(b: *mut Pl0000) -> ([u32; 4], u32) {
 pub fn apply(b: *mut Pl0000, args: [u32; 4]) {
     let [a, v, a3, a4] = args;
     let Some(vt) = (unsafe { b.as_ref() }).map(|o| o.vtable as usize) else { return };
-    let ok = crate::state::lock(&HOOKS).as_ref().is_some_and(|h| h.orig.contains_key(&vt) && h.known.contains(&(vt, args)));
-    if !ok {
-        return;
+    {
+        let mut g = crate::state::lock(&HOOKS);
+        let Some(h) = g.as_mut() else { return };
+        if !h.orig.contains_key(&vt) {
+            return;
+        }
+        if !h.known.contains(&(vt, args)) {
+            // The enemy keeps its previous action here (it can look frozen while it slides to the host's spot).
+            if h.dropped.len() < 256 && h.dropped.insert((vt, a)) {
+                tracing::warn!("enemy anim: host action {a:#x} ({v:#x} {a3:#x} {a4:#x}) never seen on class vt {vt:#x} here; not replayed");
+            }
+            if h.known.len() >= MAX_KNOWN && !h.full_logged {
+                h.full_logged = true;
+                tracing::warn!("enemy anim: replay allowlist full ({MAX_KNOWN}); new enemy actions are no longer learned");
+            }
+            return;
+        }
     }
     APPLYING.store(b as usize, Relaxed);
     unsafe { on_start(b, a, v, a3, a4) };

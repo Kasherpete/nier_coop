@@ -7,8 +7,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use super::for_each_object;
-use crate::sdk::Pl0000;
+use std::ptr::addr_of_mut;
+
+use super::{entity_by_handle, for_each_object};
+use crate::sdk::{Pl0000, cVec4};
 use crate::state::{self, HOST, InputFrame, LOCAL_EPOCH, LOCAL_INPUTS, REMOTE_ACTIVE, REMOTE_EPOCH, REMOTE_INPUTS, REMOTE_READY};
 
 /// Remote input runs this many frames after it was made (~50 ms at 60 fps), so it is usually already here.
@@ -155,19 +157,32 @@ fn report(epoch: u32, n: u32, what: &str) {
     }
 }
 
-/// FNV-1a over (handle, position in cm) of every game object except the two players, in entity-list order.
+/// FNV-1a over (type id, position in cm) of every game object except the two players, sorted. Not handles or
+/// list order: each game numbers and lists its objects itself, so those differ even when the worlds agree.
 /// Positions are rounded to 1 cm so the hash reports real divergence, not last-bit float noise.
 pub fn world_checksum(pl: *mut Pl0000, buddy: Option<*mut Pl0000>) -> u32 {
     let skip = buddy.unwrap_or(std::ptr::null_mut());
-    let mut h = Fnv::new();
+    let mut objs = Vec::new();
     for_each_object(|handle, b, p| {
         if b != pl && b != skip {
-            h.word(handle);
-            for v in [p.x, p.y, p.z] {
-                h.word((v * 100.0).round() as i32 as u32);
-            }
+            let kind = entity_by_handle(handle).map_or(0, |e| unsafe { addr_of_mut!((*e).object_id).read() });
+            objs.push(object_key(kind, p));
         }
     });
+    checksum_of(objs)
+}
+
+fn object_key(kind: u32, p: cVec4) -> [u32; 4] {
+    let cm = |v: f32| (v * 100.0).round() as i32 as u32;
+    [kind, cm(p.x), cm(p.y), cm(p.z)]
+}
+
+fn checksum_of(mut objs: Vec<[u32; 4]>) -> u32 {
+    objs.sort_unstable();
+    let mut h = Fnv::new();
+    for w in objs.iter().flatten() {
+        h.word(*w);
+    }
     h.0
 }
 
@@ -202,6 +217,16 @@ mod tests {
         assert_eq!(decide(false, 0, true, true, 5, 4, 1), Clock::Start(5));
         assert_eq!(decide(false, 0, true, true, 4, 4, 1), Clock::Keep);
         assert_eq!(decide(false, 4, false, true, 4, 4, 1), Clock::Stop);
+    }
+
+    #[test]
+    fn checksum_ignores_order() {
+        let a = object_key(0x2_0001, cVec4 { x: 1.0, y: 2.0, z: 3.0, w: 1.0 });
+        let b = object_key(0x2_0002, cVec4 { x: -4.0, y: 0.004, z: 9.0, w: 1.0 });
+        assert_eq!(checksum_of(vec![a, b]), checksum_of(vec![b, a])); // list order differs between games
+        let moved = object_key(0x2_0002, cVec4 { x: -4.0, y: 0.1, z: 9.0, w: 1.0 });
+        assert_ne!(checksum_of(vec![a, b]), checksum_of(vec![a, moved]));
+        assert_eq!(b, object_key(0x2_0002, cVec4 { x: -4.0, y: 0.0041, z: 9.0, w: 1.0 })); // sub-cm noise
     }
 
     #[test]

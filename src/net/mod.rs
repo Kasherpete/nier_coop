@@ -4,39 +4,59 @@
 //! packet loses nothing; the receiver applies the frames in order (one per tick) to the remote 2B. The
 //! sender's real state rides along only to correct drift.
 
+mod reliable;
 mod save;
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::state::{
-    self, Correction, Damage, EnemyState, InputFrame, HOST, LOCAL_CORRECTION, LOCAL_DAMAGE, LOCAL_EPOCH, LOCAL_INPUTS, LOCAL_READY,
+    self, Correction, Damage, EnemyState, InputFrame, WorldGen, HOST, LOCAL_CORRECTION, LOCAL_DAMAGE, LOCAL_EPOCH, LOCAL_INPUTS, LOCAL_READY,
     LOCAL_EVENTS, LOCAL_SCENE, LOCAL_SIGNALS, LOCAL_WORLD, MAX_ENEMIES, REDUNDANCY, REMOTE_ACTIVE, REMOTE_CORRECTION, REMOTE_DAMAGE, REMOTE_EPOCH, REMOTE_INPUTS,
     REMOTE_EVENTS, REMOTE_READY, REMOTE_SCENE, REMOTE_SIGNALS, REMOTE_WORLD,
 };
 
-/// World sync packets: magic, seq, count, then `count` items. Host -> client snapshots, client -> host damage.
-const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"NCWS");
-const DAMAGE_MAGIC: u32 = u32::from_le_bytes(*b"NCWD");
+/// World sync packets: magic, seq, host generation, client generation, count, then `count` items (see
+/// `state::WorldGen`). Host -> client snapshots, client -> host damage.
+const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"NCW2");
+const DAMAGE_MAGIC: u32 = u32::from_le_bytes(*b"NCD2");
+/// Header words between the magic and the count: seq, host generation, client generation.
+const LIST_HEAD: usize = 3;
 /// Host -> client, every second: the host's scene state names (newline-separated), for quest sync.
 const SCENE_MAGIC: u32 = u32::from_le_bytes(*b"NCSS");
 const SCENE_EVERY: Duration = Duration::from_secs(1);
-/// [magic, action id, kind, hash, flag] just ran here (see `state::LOCAL_EVENTS`); sent 3 times. Host -> client, and
-/// client -> host for objectives the client's player reached.
+/// [magic, action id, kind, hash, flag] just ran here (see `state::LOCAL_EVENTS`), over the reliable channel.
+/// Host -> client, and client -> host for objectives the client's player reached.
 const EVENT_MAGIC: u32 = u32::from_le_bytes(*b"NCEV");
-/// Host -> client: a scene signal, [magic, seq, sender id, hash, arg]; sent 3 times, the client keeps new seqs only.
+/// Host -> client: a scene signal, [magic, sender id, hash, arg], over the reliable channel (in order, once).
 const SIGNAL_MAGIC: u32 = u32::from_le_bytes(*b"NCSG");
+
+/// Failed sends so far; a send error (adapter down, Wi-Fi drop) is logged, never fatal.
+static SEND_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+fn send_failed(to: SocketAddr, e: &std::io::Error) {
+    let n = SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
+    if n % 600 == 0 {
+        tracing::warn!("send to {to} failed: {e} ({} so far); still trying", n + 1);
+    }
+}
+
+fn send(sock: &UdpSocket, p: &[u8], to: SocketAddr) {
+    if let Err(e) = sock.send_to(p, to) {
+        send_failed(to, &e);
+    }
+}
 
 /// Both ways, every second: [magic, this build's version text], so different builds say so instead of failing silently.
 const VERSION_MAGIC: u32 = u32::from_le_bytes(*b"NCVR");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const MAGIC: u32 = u32::from_le_bytes(*b"NCO3");
+const MAGIC: u32 = u32::from_le_bytes(*b"NCO4");
 const HEADER: usize = 16; // magic u32, seq u32, epoch u32, flags u32
 const FRAMES_AT: usize = HEADER + size_of::<Correction>();
-pub const PACKET_LEN: usize = FRAMES_AT + REDUNDANCY * size_of::<InputFrame>(); // 656 bytes, ~0.32 Mbit/s at 60 fps
+pub const PACKET_LEN: usize = FRAMES_AT + REDUNDANCY * size_of::<InputFrame>(); // 784 bytes, ~0.38 Mbit/s at 60 fps
 const TIMEOUT: Duration = Duration::from_secs(2);
 /// Heartbeat while no new frame is produced (loading, lockstep stopped), so ready/epoch still reach the peer.
 const HEARTBEAT: Duration = Duration::from_millis(50);
@@ -133,7 +153,8 @@ fn run(cfg: &Config) -> std::io::Result<()> {
     let mut scene_at = Instant::now();
     let mut version_at = Instant::now() - SCENE_EVERY;
     let (mut peer_version, mut warned_layout) = (None::<String>, false);
-    let (mut sig_tx, mut sig_rx) = (0u32, None::<u32>);
+    // Story events and scene signals: resent until acked, delivered once and in order.
+    let (mut rel_tx, mut rel_rx) = (reliable::Sender::new(), reliable::Receiver::new());
     // shortcut: one datagram per scene list (~1-4 KB, IP-fragmented); split it if late-game lists outgrow 64 KB.
     let mut buf = vec![0u8; 65536];
     let mut idle = None::<Correction>;
@@ -143,7 +164,9 @@ fn run(cfg: &Config) -> std::io::Result<()> {
     }
     loop {
         if let Some(s) = saves.as_mut().filter(|_| REMOTE_ACTIVE.load(Ordering::Relaxed)) {
-            s.poll(&sock, peer)?;
+            if let Err(e) = s.poll(&sock, peer) {
+                send_failed(peer, &e);
+            }
         }
         // One packet per new local frame, plus a heartbeat while no frames are produced.
         let frames: Vec<InputFrame> = state::lock(&LOCAL_INPUTS).iter().copied().collect();
@@ -157,45 +180,43 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 | (HOST.load(Ordering::Relaxed) as u32 * IS_HOST)
                 | (corr.is_some() as u32 * HAS_CORRECTION);
             let h = Header { seq: tx_seq, epoch: LOCAL_EPOCH.load(Ordering::Relaxed), flags };
-            sock.send_to(&encode(h, &corr.unwrap_or_default(), &frames), peer)?;
+            send(&sock, &encode(h, &corr.unwrap_or_default(), &frames), peer);
             if cfg.world_sync {
                 // Same pace as the inputs: the host's newest snapshot, or the client's damage totals.
                 let p = if cfg.host {
-                    encode_list(SNAPSHOT_MAGIC, tx_seq, &state::lock(&LOCAL_WORLD))
+                    let w = state::lock(&LOCAL_WORLD);
+                    encode_list(SNAPSHOT_MAGIC, [tx_seq, w.0.host, w.0.client], &w.1)
                 } else {
-                    encode_list(DAMAGE_MAGIC, tx_seq, &state::lock(&LOCAL_DAMAGE))
+                    let d = state::lock(&LOCAL_DAMAGE);
+                    encode_list(DAMAGE_MAGIC, [tx_seq, d.0.host, d.0.client], &d.1)
                 };
-                sock.send_to(&p, peer)?;
+                send(&sock, &p, peer);
             }
         }
         if cfg.world_sync && cfg.host {
             for [id, hash, arg] in std::mem::take(&mut *state::lock(&LOCAL_SIGNALS)) {
-                sig_tx = sig_tx.wrapping_add(1);
-                let p: Vec<u8> = [SIGNAL_MAGIC, sig_tx, id, hash, arg].iter().flat_map(|v| v.to_le_bytes()).collect();
-                for _ in 0..3 {
-                    sock.send_to(&p, peer)?;
-                }
+                rel_tx.push([SIGNAL_MAGIC, id, hash, arg].iter().flat_map(|v| v.to_le_bytes()).collect());
             }
         }
         // Both ways: the client sends the objectives its player reached (see `hooks::events`).
         if cfg.world_sync {
             for e in std::mem::take(&mut *state::lock(&LOCAL_EVENTS)) {
-                let p: Vec<u8> = [EVENT_MAGIC].iter().chain(&e).flat_map(|v| v.to_le_bytes()).collect();
-                for _ in 0..3 {
-                    sock.send_to(&p, peer)?;
-                }
+                rel_tx.push([EVENT_MAGIC].iter().chain(&e).flat_map(|v| v.to_le_bytes()).collect());
             }
+        }
+        for p in rel_tx.due(Instant::now()) {
+            send(&sock, &p, peer);
         }
         if cfg.world_sync && cfg.host && scene_at.elapsed() >= SCENE_EVERY {
             scene_at = Instant::now();
             let names = state::lock(&LOCAL_SCENE).clone();
             if !names.is_empty() && names.len() < buf.len() - 4 {
-                sock.send_to(&[&SCENE_MAGIC.to_le_bytes()[..], &names].concat(), peer)?;
+                send(&sock, &[&SCENE_MAGIC.to_le_bytes()[..], &names].concat(), peer);
             }
         }
         if version_at.elapsed() >= SCENE_EVERY {
             version_at = Instant::now();
-            sock.send_to(&[&VERSION_MAGIC.to_le_bytes()[..], VERSION.as_bytes()].concat(), peer)?;
+            send(&sock, &[&VERSION_MAGIC.to_le_bytes()[..], VERSION.as_bytes()].concat(), peer);
         }
         match sock.recv_from(&mut buf) {
             // Only the configured peer's IP is trusted; anything else is dropped.
@@ -207,8 +228,13 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                 }
                 // Save data only inside a live session (input packets already flowing), never as a first packet.
                 if let Some(s) = saves.as_mut().filter(|_| REMOTE_ACTIVE.load(Ordering::Relaxed)) {
-                    if s.on_packet(&buf[..n], &sock, peer)? {
-                        continue;
+                    match s.on_packet(&buf[..n], &sock, peer) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            send_failed(peer, &e);
+                            continue;
+                        }
                     }
                 }
                 // Scene signals/events/names, like saves, only inside a live session (never as a first packet).
@@ -222,32 +248,35 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                         }
                         peer_version = Some(v.to_string());
                     }
-                } else if n == 20 && buf[..4] == SIGNAL_MAGIC.to_le_bytes() {
-                    let w = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
-                    if live && !cfg.host && sig_rx.is_none_or(|r| (w(4).wrapping_sub(r) as i32) > 0) {
-                        sig_rx = Some(w(4));
-                        state::lock(&REMOTE_SIGNALS).push([w(8), w(12), w(16)]);
+                } else if n >= 4 && buf[..4] == reliable::DATA_MAGIC.to_le_bytes() {
+                    // Story events and signals only inside a live session; not acked otherwise, so they come again.
+                    if live {
+                        let (ack, bodies) = rel_rx.on_packet(&buf[..n]);
+                        if let Some(a) = ack {
+                            send(&sock, &a, peer);
+                        }
+                        for b in bodies {
+                            deliver(&b, cfg.host);
+                        }
                     }
-                } else if n == 20 && buf[..4] == EVENT_MAGIC.to_le_bytes() {
-                    let w = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
-                    // The host only takes objectives the client's player reached: kind 2, DONE.
-                    if live && (!cfg.host || (w(8) == 2 && w(12) == 0x26b8_0d1f)) {
-                        state::lock(&REMOTE_EVENTS).push([w(4), w(8), w(12), w(16)]);
-                    }
+                } else if n >= 4 && buf[..4] == reliable::ACK_MAGIC.to_le_bytes() {
+                    rel_tx.on_ack(&buf[..n]);
                 } else if n >= 4 && buf[..4] == SCENE_MAGIC.to_le_bytes() {
                     if live && !cfg.host {
                         *state::lock(&REMOTE_SCENE) = Some(buf[4..n].to_vec()); // validated by the game thread
                     }
-                } else if let Some((seq, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {
-                    let fresh = world_rx_seq.is_none_or(|r: u32| (seq.wrapping_sub(r) as i32) > 0);
-                    if !cfg.host && fresh && s.iter().all(|e| sane(&[e.yaw, e.pos.x, e.pos.y, e.pos.z, e.pos.w])) {
-                        world_rx_seq = Some(seq);
-                        *state::lock(&REMOTE_WORLD) = Some((Instant::now(), s));
+                } else if let Some((h, s)) = decode_list::<EnemyState>(SNAPSHOT_MAGIC, &buf[..n]) {
+                    let fresh = world_rx_seq.is_none_or(|r: u32| (h[0].wrapping_sub(r) as i32) > 0);
+                    // One enemy with a bad float is left out, not the whole snapshot (that stalled every enemy).
+                    let s: Vec<EnemyState> = s.into_iter().filter(|e| sane(&[e.yaw, e.pos.x, e.pos.y, e.pos.z, e.pos.w])).collect();
+                    if !cfg.host && fresh {
+                        world_rx_seq = Some(h[0]);
+                        *state::lock(&REMOTE_WORLD) = Some((Instant::now(), WorldGen { host: h[1], client: h[2] }, s));
                     }
-                } else if let Some((_, d)) = decode_list::<Damage>(DAMAGE_MAGIC, &buf[..n]) {
-                    // Totals only grow, so order does not matter: the host applies what is new.
+                } else if let Some((h, d)) = decode_list::<Damage>(DAMAGE_MAGIC, &buf[..n]) {
+                    // Totals only grow within a generation, so order does not matter: the host applies what is new.
                     if cfg.host {
-                        *state::lock(&REMOTE_DAMAGE) = d;
+                        *state::lock(&REMOTE_DAMAGE) = Some((WorldGen { host: h[1], client: h[2] }, d));
                     }
                 } else if let Some((h, mut c, mut frames)) = decode(&buf[..n]) {
                     let seq = h.seq;
@@ -265,12 +294,15 @@ fn run(cfg: &Config) -> std::io::Result<()> {
                     // Mirror test (peer == bind): stand the copy 2 m aside, or it collides with the player it copies.
                     if mirror {
                         c.pos.x += 2.0;
+                        for f in &mut frames {
+                            f.pos.x += 2.0;
+                        }
                         if cfg.mirror_idle {
                             // Frozen where it first appeared, idle inputs, no animation replays.
                             let first = *idle.get_or_insert(c);
                             c = Correction { pos: first.pos, rot: first.rot, hp: c.hp, ..Default::default() };
                             for f in &mut frames {
-                                *f = InputFrame { frame: f.frame, checksum: f.checksum, ..Default::default() };
+                                *f = InputFrame { frame: f.frame, checksum: f.checksum, pos: first.pos, ..Default::default() };
                             }
                         }
                     }
@@ -295,7 +327,11 @@ fn run(cfg: &Config) -> std::io::Result<()> {
             Ok(_) => {}
             // ConnectionReset: Windows reports ICMP port-unreachable from a previous send_to; harmless.
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Not fatal either: the socket stays bound, the network may come back.
+                send_failed(peer, &e);
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         if last_rx.is_some_and(|t| t.elapsed() > TIMEOUT) && REMOTE_ACTIVE.swap(false, Ordering::Relaxed) {
             tracing::warn!("peer timed out; buddy AI restored");
@@ -308,9 +344,10 @@ fn run(cfg: &Config) -> std::io::Result<()> {
             }
             *state::lock(&REMOTE_WORLD) = None;
             *state::lock(&REMOTE_SCENE) = None;
-            sig_rx = None; // a restarted host counts from 1 again
+            rel_tx.clear(); // the peer's next session starts after what we still had queued
+            rel_rx.reset();
             state::lock(&REMOTE_SIGNALS).clear();
-            state::lock(&REMOTE_DAMAGE).clear();
+            *state::lock(&REMOTE_DAMAGE) = None;
             REMOTE_READY.store(false, Ordering::Relaxed);
             state::lock(&REMOTE_INPUTS).reset();
         }
@@ -333,11 +370,29 @@ pub fn encode(h: Header, c: &Correction, frames: &[InputFrame]) -> [u8; PACKET_L
     p
 }
 
-/// World sync packet: magic, seq, count, then at most `MAX_ENEMIES` items.
-fn encode_list<T: bytemuck::Pod>(magic: u32, seq: u32, items: &[T]) -> Vec<u8> {
+/// One message from the reliable channel (already in order and deduplicated). Trust boundary: exact lengths.
+fn deliver(b: &[u8], host: bool) {
+    let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    if b.len() == 16 && w(0) == SIGNAL_MAGIC {
+        if !host {
+            state::lock(&REMOTE_SIGNALS).push([w(1), w(2), w(3)]);
+        }
+    } else if b.len() == 20 && w(0) == EVENT_MAGIC {
+        // The host only takes objectives the client's player reached: kind 2, DONE.
+        if !host || (w(2) == 2 && w(3) == 0x26b8_0d1f) {
+            state::lock(&REMOTE_EVENTS).push([w(1), w(2), w(3), w(4)]);
+        }
+    }
+}
+
+/// Bytes before the items of a world sync list: magic, `LIST_HEAD` words, count.
+const LIST_AT: usize = 4 * (LIST_HEAD + 2);
+
+/// World sync packet: magic, the header words, count, then at most `MAX_ENEMIES` items.
+fn encode_list<T: bytemuck::Pod>(magic: u32, head: [u32; LIST_HEAD], items: &[T]) -> Vec<u8> {
     let items = &items[..items.len().min(MAX_ENEMIES)];
-    let mut p = Vec::with_capacity(12 + size_of_val(items));
-    for w in [magic, seq, items.len() as u32] {
+    let mut p = Vec::with_capacity(LIST_AT + size_of_val(items));
+    for w in [magic].iter().chain(&head).chain(&[items.len() as u32]) {
         p.extend_from_slice(&w.to_le_bytes());
     }
     p.extend_from_slice(bytemuck::cast_slice(items));
@@ -345,13 +400,14 @@ fn encode_list<T: bytemuck::Pod>(magic: u32, seq: u32, items: &[T]) -> Vec<u8> {
 }
 
 /// Trust boundary: magic, count within `MAX_ENEMIES`, and exact length for that count.
-fn decode_list<T: bytemuck::Pod>(magic: u32, p: &[u8]) -> Option<(u32, Vec<T>)> {
-    let word = |i: usize| p.get(i..i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-    let n = word(8)? as usize;
-    if word(0)? != magic || n > MAX_ENEMIES || p.len() != 12 + n * size_of::<T>() {
+fn decode_list<T: bytemuck::Pod>(magic: u32, p: &[u8]) -> Option<([u32; LIST_HEAD], Vec<T>)> {
+    let word = |i: usize| p.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let n = word(LIST_HEAD + 1)? as usize;
+    if word(0)? != magic || n > MAX_ENEMIES || p.len() != LIST_AT + n * size_of::<T>() {
         return None;
     }
-    Some((word(4)?, p[12..].chunks_exact(size_of::<T>()).map(bytemuck::pod_read_unaligned).collect()))
+    let head = [word(1)?, word(2)?, word(3)?];
+    Some((head, p[LIST_AT..].chunks_exact(size_of::<T>()).map(bytemuck::pod_read_unaligned).collect()))
 }
 
 /// Trust boundary: magic, then 1-32 printable ASCII characters (the text goes into the log).
@@ -374,7 +430,7 @@ pub fn decode(p: &[u8]) -> Option<(Header, Correction, [InputFrame; REDUNDANCY])
     let c: Correction = bytemuck::pod_read_unaligned(&p[HEADER..FRAMES_AT]);
     let frames: [InputFrame; REDUNDANCY] = bytemuck::pod_read_unaligned(&p[FRAMES_AT..]);
     let floats_ok = sane(&[c.pos.x, c.pos.y, c.pos.z, c.pos.w, c.rot.x, c.rot.y, c.rot.z, c.rot.w, c.pod_cooldown])
-        && frames.iter().all(|f| sane(&[f.speed, f.facing2, f.aim.x, f.aim.y, f.aim.z, f.aim.w]));
+        && frames.iter().all(|f| sane(&[f.speed, f.facing2, f.aim.x, f.aim.y, f.aim.z, f.aim.w, f.pos.x, f.pos.y, f.pos.z, f.pos.w]));
     floats_ok.then_some((h, c, frames))
 }
 
@@ -587,19 +643,34 @@ mod tests {
 
     #[test]
     fn world_lists_roundtrip_and_reject() {
-        let e = EnemyState { handle: 0x1234_5600, kind: 7, hp: 90, yaw: 1.5, pos: cVec4 { x: 1.0, ..Default::default() }, anim: [3, 0, 0, 1], anim_seq: 5 };
-        let p = encode_list(SNAPSHOT_MAGIC, 9, &[e, e]);
-        assert_eq!(decode_list::<EnemyState>(SNAPSHOT_MAGIC, &p), Some((9, vec![e, e])));
+        let e = EnemyState { handle: 0x1234_5600, kind: 7, hp: 90, yaw: 1.5, pos: cVec4 { x: 1.0, ..Default::default() }, anim: [3, 0, 0, 1], anim_seq: 5, applied: 4 };
+        let p = encode_list(SNAPSHOT_MAGIC, [9, 2, 3], &[e, e]);
+        assert_eq!(decode_list::<EnemyState>(SNAPSHOT_MAGIC, &p), Some(([9, 2, 3], vec![e, e])));
         assert_eq!(decode_list::<EnemyState>(DAMAGE_MAGIC, &p), None); // wrong type
         assert_eq!(decode_list::<EnemyState>(SNAPSHOT_MAGIC, &p[..p.len() - 1]), None);
         assert_eq!(decode_list::<EnemyState>(SNAPSHOT_MAGIC, &p[..4]), None);
         let mut huge = p.clone();
-        huge[8..12].copy_from_slice(&1000u32.to_le_bytes());
+        huge[16..20].copy_from_slice(&1000u32.to_le_bytes());
         assert_eq!(decode_list::<EnemyState>(SNAPSHOT_MAGIC, &huge), None);
-        assert_eq!(encode_list(SNAPSHOT_MAGIC, 0, &vec![e; 40]).len(), 12 + MAX_ENEMIES * size_of::<EnemyState>()); // capped
-        assert!(12 + MAX_ENEMIES * size_of::<EnemyState>() <= 1472); // one UDP payload, no fragmentation
-        let d = encode_list(DAMAGE_MAGIC, 1, &[Damage { handle: 5, total: 30 }]);
-        assert_eq!(decode_list::<Damage>(DAMAGE_MAGIC, &d), Some((1, vec![Damage { handle: 5, total: 30 }])));
-        assert_eq!(decode_list::<Damage>(DAMAGE_MAGIC, &encode_list::<Damage>(DAMAGE_MAGIC, 2, &[])), Some((2, vec![])));
+        assert_eq!(encode_list(SNAPSHOT_MAGIC, [0; 3], &vec![e; 40]).len(), LIST_AT + MAX_ENEMIES * size_of::<EnemyState>()); // capped
+        assert!(LIST_AT + MAX_ENEMIES * size_of::<EnemyState>() <= 1472); // one UDP payload, no fragmentation
+        let d = encode_list(DAMAGE_MAGIC, [1, 2, 3], &[Damage { handle: 5, total: 30 }]);
+        assert_eq!(decode_list::<Damage>(DAMAGE_MAGIC, &d), Some(([1, 2, 3], vec![Damage { handle: 5, total: 30 }])));
+        assert_eq!(decode_list::<Damage>(DAMAGE_MAGIC, &encode_list::<Damage>(DAMAGE_MAGIC, [2, 0, 0], &[])), Some(([2, 0, 0], vec![])));
+    }
+
+    #[test]
+    fn reliable_bodies_parse() {
+        state::lock(&REMOTE_SIGNALS).clear();
+        state::lock(&REMOTE_EVENTS).clear();
+        let sig: Vec<u8> = [SIGNAL_MAGIC, 1, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ev: Vec<u8> = [EVENT_MAGIC, 7, 2, 0x26b8_0d1f, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let other: Vec<u8> = [EVENT_MAGIC, 7, 0, 5, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        deliver(&sig, false);
+        deliver(&ev, true); // host takes a reached objective
+        deliver(&other, true); // but not a cutscene from the client
+        deliver(&sig[..12], false); // short: ignored
+        assert_eq!(*state::lock(&REMOTE_SIGNALS), vec![[1, 2, 3]]);
+        assert_eq!(*state::lock(&REMOTE_EVENTS), vec![[7, 2, 0x26b8_0d1f, 0]]);
     }
 }

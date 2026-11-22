@@ -40,14 +40,24 @@ const WAIT: u32 = 0x4b7b6e51;
 /// SPAWN spawns the set, then BATTLE.
 const SPAWN_DELAY: u32 = 0x45ce422b;
 const SPAWN: u32 = 0x3aa89d11;
-/// How long a host spawn waits for the client's enemy set to start.
+/// How long a host spawn waits for the client's (loaded) enemy set to start.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
-/// Client: (enemy set id, received) the host spawned, not yet started here.
 /// How long a host cutscene waits for the one playing here to end.
 const PLAY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Client: (cutscene id, received) the host played, waiting for the one playing here.
+/// Client: (cutscene id, queued) the host played, waiting for the one playing here.
 static PENDING_PLAYS: std::sync::Mutex<Vec<(u32, Instant)>> = std::sync::Mutex::new(Vec::new());
+/// Client: (enemy set id, queued) the host spawned, loaded here but not yet started.
 static PENDING_SPAWNS: std::sync::Mutex<Vec<(u32, Instant)>> = std::sync::Mutex::new(Vec::new());
+/// Host events whose action is not loaded here yet, retried until it is: each game loads action groups by itself,
+/// and a session log showed the client load a boss-fight group 57 s after the host had spawned its 26 enemy sets.
+/// Dropping those events left the client without the host's enemies for the rest of the fight.
+static PENDING_LOADS: std::sync::Mutex<Vec<([u32; 4], Instant)>> = std::sync::Mutex::new(Vec::new());
+/// How long an event waits for its action to load here; a cutscene only as long as `PLAY_TIMEOUT`.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(180);
+/// Frames between retries of `PENDING_LOADS` (each walks every loaded action).
+const RETRY_EVERY: u32 = 30;
+const MAX_PENDING_LOADS: usize = 512;
+static TICKS: AtomicU32 = AtomicU32::new(0);
 const MAX_GROUPS: usize = 0x10000;
 const MAX_ACTIONS: usize = 0x10000;
 /// A cutscene id received again within this time is the same start (sent several times against loss).
@@ -66,8 +76,10 @@ struct Addr {
 }
 static ADDR: OnceLock<Addr> = OnceLock::new();
 static LAST: std::sync::Mutex<Option<([u32; 3], Instant)>> = std::sync::Mutex::new(None);
-/// Sender context last seen per action id (from the game's own signals).
-static CONTEXTS: std::sync::Mutex<Option<std::collections::HashMap<u32, usize>>> = std::sync::Mutex::new(None);
+/// Sender context last seen per action id (from the game's own signals), with the action it came from. Areas
+/// stream in and out while the player stays alive, so an id can be unloaded and loaded again with a new context:
+/// a context is only used while the action with that id is still the same object.
+static CONTEXTS: std::sync::Mutex<Option<std::collections::HashMap<u32, (usize, usize)>>> = std::sync::Mutex::new(None);
 
 /// Argument of `Action::request_state` (built by the engine from a state hash).
 #[repr(C)]
@@ -205,7 +217,14 @@ extern "system" fn on_post(queue: usize, from: *const Sender, sig: *const StateR
     let r = orig(queue, from, sig);
     if let (Some(f), Some(q)) = (unsafe { from.as_ref() }, unsafe { sig.as_ref() }) {
         if f.id != 0 && f.context != 0 {
-            state::lock(&CONTEXTS).get_or_insert_with(Default::default).insert(f.id, f.context);
+            let mut g = state::lock(&CONTEXTS);
+            let m = g.get_or_insert_with(Default::default);
+            // Looked up only when new or changed: actions post signals every frame.
+            if m.get(&f.id).is_none_or(|&(c, _)| c != f.context) {
+                if let Some(act) = ADDR.get().and_then(|a| find(a, f.id, None)) {
+                    m.insert(f.id, (f.context, act as usize));
+                }
+            }
         }
         if f.id != 0 && HOST.load(Relaxed) && WORLD_SYNC.load(Relaxed) && REMOTE_ACTIVE.load(Relaxed) {
             state::lock(&LOCAL_SIGNALS).push([f.id, q.hash, q.flag]);
@@ -226,12 +245,24 @@ pub fn forget_contexts() {
 
 /// Client, game thread: start the cutscenes the host started and repeat its signals.
 pub fn tick() {
+    if !REMOTE_ACTIVE.load(Relaxed) {
+        // Peer gone: what it ran belongs to a session that is over.
+        state::lock(&PENDING_LOADS).clear();
+    }
     let sigs = std::mem::take(&mut *state::lock(&REMOTE_SIGNALS));
     if let Some(a) = ADDR.get().filter(|_| !HOST.load(Relaxed)) {
         for [id, hash, arg] in sigs {
-            // A context is only trusted while its action is still loaded (an area unload frees both).
-            let ctx = state::lock(&CONTEXTS).as_ref().and_then(|c| c.get(&id).copied());
-            let Some(context) = ctx.filter(|_| find(a, id, None).is_some()) else {
+            // A context is only trusted while the very action it was seen with is still loaded (an area unload
+            // frees both; a reload of that id makes a new action with a new context).
+            let entry = state::lock(&CONTEXTS).as_ref().and_then(|c| c.get(&id).copied());
+            let here = find(a, id, None).map(|p| p as usize);
+            let Some((context, _)) = entry.filter(|&(_, act)| here == Some(act)) else {
+                if entry.is_some() {
+                    // Reloaded or gone: forget it, the action's next own signal teaches the new context.
+                    if let Some(c) = state::lock(&CONTEXTS).as_mut() {
+                        c.remove(&id);
+                    }
+                }
                 tracing::debug!("signal sync: sender {id:08x} not loaded here");
                 continue;
             };
@@ -251,36 +282,84 @@ pub fn tick() {
         }
     }
     let ids = std::mem::take(&mut *state::lock(&REMOTE_EVENTS));
-    if let Some(a) = ADDR.get().filter(|_| !state::lock(&PENDING_SPAWNS).is_empty()) {
+    let Some(a) = ADDR.get() else { return };
+    if !state::lock(&PENDING_SPAWNS).is_empty() {
         spawn_pending(a);
     }
-    if let Some(a) = ADDR.get().filter(|_| !state::lock(&PENDING_PLAYS).is_empty()) {
+    if !state::lock(&PENDING_PLAYS).is_empty() {
         play_pending(a);
     }
-    let Some(a) = ADDR.get().filter(|_| !ids.is_empty()) else { return };
-    apply_events(a, ids);
+    if !ids.is_empty() {
+        apply_events(a, ids);
+    }
+    if TICKS.fetch_add(1, Relaxed) % RETRY_EVERY == 0 && !state::lock(&PENDING_LOADS).is_empty() {
+        retry_loads(a);
+    }
     APPLYING.store(0, Relaxed);
 }
 
 /// Client: everything the host ran; host: objectives the client reached (filtered by the net thread).
 fn apply_events(a: &Addr, ids: Vec<[u32; 4]>) {
-    for [id, kind, hash, flag] in ids {
-        let mut last = state::lock(&LAST);
-        if last.is_some_and(|(l, t)| l == [id, kind, hash] && t.elapsed() < REPEAT) {
-            continue;
+    for ev in ids {
+        let [id, kind, hash, _] = ev;
+        {
+            // The reliable channel delivers each event once; this still drops a quick repeat of the same step.
+            let mut last = state::lock(&LAST);
+            if last.is_some_and(|(l, t)| l == [id, kind, hash] && t.elapsed() < REPEAT) {
+                continue;
+            }
+            *last = Some(([id, kind, hash], Instant::now()));
         }
-        *last = Some(([id, kind, hash], Instant::now()));
-        APPLYING.store(id, Relaxed);
-        let vt = match kind {
-            0 => a.phase_vt,
-            1 => a.send_vt,
-            2 => a.goal_vt,
-            _ => a.enemy_vt,
-        };
-        let Some(act) = find(a, id, Some(vt)) else {
-            tracing::warn!("cutscene sync: host ran {id:08x} (kind {kind}), not loaded here");
-            continue;
-        };
+        if !apply_event(a, ev) {
+            let mut p = state::lock(&PENDING_LOADS);
+            if p.iter().any(|(e, _)| e[..3] == ev[..3]) {
+                continue;
+            }
+            if p.len() == MAX_PENDING_LOADS {
+                p.remove(0);
+            }
+            tracing::info!("cutscene sync: host ran {id:08x} (kind {kind}), not loaded here yet: waiting for it to load");
+            p.push((ev, Instant::now()));
+        }
+    }
+}
+
+fn load_timeout(kind: u32) -> Duration {
+    if kind == 0 { PLAY_TIMEOUT } else { LOAD_TIMEOUT }
+}
+
+/// Client: the host events whose action has loaded here since, applied now (late, but the host's enemies and
+/// doors then exist here too); the rest keep waiting until their timeout.
+fn retry_loads(a: &Addr) {
+    let pending = std::mem::take(&mut *state::lock(&PENDING_LOADS));
+    let mut keep = Vec::new();
+    for (ev, t) in pending {
+        let [id, kind, ..] = ev;
+        if t.elapsed() >= load_timeout(kind) {
+            tracing::warn!("cutscene sync: host ran {id:08x} (kind {kind}), never loaded here in {} s; dropped", load_timeout(kind).as_secs());
+        } else if apply_event(a, ev) {
+            tracing::info!("cutscene sync: {id:08x} (kind {kind}) loaded here {:.0} s after the host ran it; applied", t.elapsed().as_secs_f32());
+        } else {
+            keep.push((ev, t));
+        }
+    }
+    // Events received meanwhile go after the older ones.
+    let mut p = state::lock(&PENDING_LOADS);
+    keep.append(&mut p);
+    *p = keep;
+}
+
+/// Applies one host event; false when its action is not loaded here (yet).
+fn apply_event(a: &Addr, [id, kind, hash, flag]: [u32; 4]) -> bool {
+    APPLYING.store(id, Relaxed);
+    let vt = match kind {
+        0 => a.phase_vt,
+        1 => a.send_vt,
+        2 => a.goal_vt,
+        _ => a.enemy_vt,
+    };
+    let Some(act) = find(a, id, Some(vt)) else { return false };
+    {
         let state = unsafe { (*act).state };
         if kind == 3 {
             // Its own update spawns the enemies (then BATTLE) once past this state, area condition or not.
@@ -314,13 +393,14 @@ fn apply_events(a: &Addr, ids: Vec<[u32; 4]>) {
             // The run method only writes a status word at +0x0C of `out`; 0x40 bytes is ample.
             let run = unsafe { (vt as *const usize).add(patterns::SEND_COMMAND_RUN).read() };
             if !super::in_module(run) {
-                continue;
+                return true;
             }
             let mut out = [0u8; 0x40];
             unsafe { std::mem::transmute::<usize, extern "system" fn(*mut SceneAction, *mut u8)>(run)(act, out.as_mut_ptr()) };
             tracing::info!("cutscene sync: ran SendCommand {id:08x} (state {state:08x} -> {:08x})", unsafe { (*act).state });
         }
     }
+    true
 }
 
 /// Client: plays the cutscenes the host played, one at a time. Starting one while another still plays here (the
@@ -354,7 +434,7 @@ fn play_pending(a: &Addr) {
 }
 
 /// Client: starts the spawn of the enemy sets the host spawned, once each has started here (WAIT); drops each
-/// after `SPAWN_TIMEOUT`, or when it spawned by itself.
+/// after `SPAWN_TIMEOUT`, or when it spawned by itself. (A set not loaded here at all waits in `PENDING_LOADS`.)
 fn spawn_pending(a: &Addr) {
     state::lock(&PENDING_SPAWNS).retain(|&(id, t)| {
         let Some(act) = find(a, id, Some(a.enemy_vt)) else {

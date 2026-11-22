@@ -85,6 +85,8 @@ $lines = @(
     # Inputs alone do not start walk/run on the spawned 2B: replay the other player's animations too.
     'anim_replay=true',
     'world_sync=true',
+    # The host's enemies decide every enemy action; delete this line if enemies crash the game.
+    'enemy_anim=true',
     # The host's newest save is copied into the same slot here (own file kept as SlotData_N.dat.nier_coop.bak).
     'save_sync=true'
 )

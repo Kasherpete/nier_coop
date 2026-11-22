@@ -15,7 +15,7 @@ use retour::{RawDetour, static_detour};
 use crate::scan;
 use crate::sdk::{self, Entity, EntityDescriptor, Pl0000, cVec4, patterns};
 use crate::state::{
-    self, Correction, InputFrame, LOCAL_CORRECTION, LOCAL_INPUTS, LOCAL_READY, LOCKSTEP, REDUNDANCY, REMOTE_ACTIVE,
+    self, Correction, HOST, InputFrame, LOCAL_CORRECTION, LOCAL_INPUTS, LOCAL_READY, LOCKSTEP, REDUNDANCY, REMOTE_ACTIVE,
     REMOTE_CORRECTION, REMOTE_INPUTS,
 };
 
@@ -23,6 +23,7 @@ mod lockstep;
 pub mod savefile;
 mod spawn;
 pub(crate) use spawn::crc32;
+mod enemy_anim;
 mod events;
 mod quest;
 mod world;
@@ -68,6 +69,11 @@ static PEER_DEAD_FRAMES: AtomicU32 = AtomicU32::new(u32::MAX);
 const PEER_DEAD_HOLD: u32 = 120; // ~2 s at 0 hp: a real death, not a 1-frame revive
 /// Local player present with health > 0 last tick; its edges reset world sync and bring the spawned 2B back.
 static LOCAL_ALIVE: AtomicBool = AtomicBool::new(false);
+/// Client: we died (not an area unload), so after the respawn we join the host's spot: each game reloads its own
+/// last checkpoint, and the client's can be a different one (seen in a boss fight: host at its save point, client
+/// at the boss start).
+static REJOIN_HOST: AtomicBool = AtomicBool::new(false);
+const REJOIN_DIST: f32 = 30.0; // m; closer than this both reloaded the same checkpoint
 
 /// Next `PEER_DEAD_FRAMES` value for the peer's current health. While we are dead or loading ourselves we reload
 /// anyway, so it disarms: the peer's 0 hp (its own death, or a stale value sent while it loads) must not kill the
@@ -414,6 +420,7 @@ extern "system" fn on_tick() {
             }
         } else {
             PEER_DEAD_FRAMES.store(u32::MAX, Relaxed);
+            REJOIN_HOST.store(pl.is_some() && !HOST.load(Relaxed), Relaxed);
         }
     }
     LOCAL_READY.store(pl.is_some(), Relaxed);
@@ -431,6 +438,15 @@ extern "system" fn on_tick() {
             kill_local(pl);
         }
         PEER_DEAD_FRAMES.store(if n >= PEER_DEAD_HOLD { u32::MAX } else { n }, Relaxed);
+        // Correction is None while the host loads, so hp > 0 here means the host has respawned.
+        if alive && c.hp > 0 && REJOIN_HOST.swap(false, Relaxed) {
+            let p = unsafe { addr_of_mut!((*pl).position).read() };
+            let d = ((c.pos.x - p.x).powi(2) + (c.pos.y - p.y).powi(2) + (c.pos.z - p.z).powi(2)).sqrt();
+            if d > REJOIN_DIST {
+                tracing::info!("respawned {d:.0} m from the host (different checkpoint): warping to the host");
+                teleport(pl, c.pos, c.rot);
+            }
+        }
     }
     let wait = SPAWN_WAIT.load(Relaxed);
     SPAWN_WAIT.store(wait.saturating_sub(1), Relaxed);

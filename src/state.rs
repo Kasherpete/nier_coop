@@ -137,8 +137,10 @@ pub struct EnemyState {
     pub hp: u32,     // 0x08 BehaviorAppBase::health
     pub yaw: f32,    // 0x0C rotation.y
     pub pos: cVec4,  // 0x10
+    pub anim: [u32; 4], // 0x20 last start_animation args (`enemy_anim=true`)
+    pub anim_seq: u32,  // 0x30 start_animation calls so far; a change means a new action to replay
 }
-const _: () = assert!(size_of::<EnemyState>() == 0x20);
+const _: () = assert!(size_of::<EnemyState>() == 0x34);
 
 /// Total damage the client has dealt to one enemy (cumulative, so a lost packet loses nothing).
 #[repr(C)]
@@ -150,8 +152,11 @@ pub struct Damage {
 const _: () = assert!(size_of::<Damage>() == 0x8);
 
 /// Enemies per snapshot (the ones nearest the client), and damage entries per packet.
-pub const MAX_ENEMIES: usize = 32;
+/// 24 * 52 B + 12 keeps a snapshot inside one 1472 B UDP payload (no IP fragmentation).
+pub const MAX_ENEMIES: usize = 24;
 pub static WORLD_SYNC: AtomicBool = AtomicBool::new(false);
+/// `enemy_anim=true`: with world sync, the host's enemies also decide every action (see `hooks/enemy_anim.rs`).
+pub static ENEMY_ANIM: AtomicBool = AtomicBool::new(false);
 /// Host: this frame's snapshot (game thread writes, net sends). Client: newest snapshot received and when.
 pub static LOCAL_WORLD: Mutex<Vec<EnemyState>> = Mutex::new(Vec::new());
 pub static REMOTE_WORLD: Mutex<Option<(std::time::Instant, Vec<EnemyState>)>> = Mutex::new(None);

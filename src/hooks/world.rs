@@ -8,10 +8,10 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use super::{PL_VTABLE, entity_by_handle, for_each_object, in_module};
+use super::{PL_VTABLE, enemy_anim, entity_by_handle, for_each_object, in_module};
 use crate::sdk::{Pl0000, cVec4};
 use crate::state::{
-    self, Damage, EnemyState, HOST, LOCAL_DAMAGE, LOCAL_WORLD, MAX_ENEMIES, REMOTE_ACTIVE, REMOTE_CORRECTION, REMOTE_DAMAGE,
+    self, Damage, ENEMY_ANIM, EnemyState, HOST, LOCAL_DAMAGE, LOCAL_WORLD, MAX_ENEMIES, REMOTE_ACTIVE, REMOTE_CORRECTION, REMOTE_DAMAGE,
     REMOTE_WORLD, WORLD_SYNC,
 };
 
@@ -30,6 +30,7 @@ struct World {
     written: HashMap<u32, u32>, // client: hp we wrote last frame per handle
     dealt: HashMap<u32, u32>,   // client: damage total dealt per handle
     paired: HashMap<u32, u32>,  // client: host handle -> our handle (each game numbers its objects itself)
+    anim_seen: HashMap<u32, u32>, // client: host handle -> last host anim_seq seen
     logged: bool,
     frames: u32, // host: frames with no enemy found, for the one-time name dump
 }
@@ -38,6 +39,9 @@ static WORLD: Mutex<Option<World>> = Mutex::new(None);
 pub fn tick(pl: *mut Pl0000) {
     let mut guard = state::lock(&WORLD);
     if !WORLD_SYNC.load(Relaxed) || !REMOTE_ACTIVE.load(Relaxed) {
+        if guard.take().is_some() {
+            enemy_anim::reset();
+        }
         *guard = None; // peer gone: forget everything, handles mean nothing in the next session
         return;
     }
@@ -62,6 +66,7 @@ fn enemy(handle: u32, kind: Option<u32>) -> Option<(*mut Pl0000, u32)> {
 /// damage total lands on a reloaded enemy that got a reused handle.
 pub fn reset() {
     *state::lock(&WORLD) = None;
+    enemy_anim::reset();
     state::lock(&LOCAL_WORLD).clear();
     state::lock(&LOCAL_DAMAGE).clear();
     state::lock(&REMOTE_DAMAGE).clear();
@@ -86,6 +91,9 @@ fn host(w: &mut World, pl: *mut Pl0000) {
     let mut snap = Vec::new();
     for_each_object(|handle, b, pos| {
         let Some((_, kind)) = enemy(handle, None) else { return };
+        if ENEMY_ANIM.load(Relaxed) {
+            enemy_anim::hook(b);
+        }
         let hp = unsafe { addr_of_mut!((*b).health).read() };
         if hp > 0 {
             w.seen.insert(handle);
@@ -93,7 +101,8 @@ fn host(w: &mut World, pl: *mut Pl0000) {
             return;
         }
         let yaw = unsafe { addr_of_mut!((*b).rotation).read().y };
-        snap.push(EnemyState { handle, kind, hp, yaw, pos });
+        let (anim, anim_seq) = enemy_anim::last(b);
+        snap.push(EnemyState { handle, kind, hp, yaw, pos, anim, anim_seq });
     });
     snap.sort_by(|a, b| dist2(a.pos, center).total_cmp(&dist2(b.pos, center)));
     snap.truncate(MAX_ENEMIES);
@@ -125,8 +134,13 @@ fn host(w: &mut World, pl: *mut Pl0000) {
 fn client(w: &mut World) {
     let snap = match &*state::lock(&REMOTE_WORLD) {
         Some((at, s)) if at.elapsed() < STALE => s.clone(),
-        _ => return,
+        _ => {
+            enemy_anim::set_blocked([]); // host loading or gone: our own AI drives our enemies again
+            return;
+        }
     };
+    let anim = ENEMY_ANIM.load(Relaxed);
+    let mut driven = Vec::new();
     w.paired.retain(|_, ours| enemy(*ours, None).is_some());
     let mut free: Vec<(u32, u32, cVec4)> = Vec::new(); // our unpaired enemies: handle, kind, position
     if snap.iter().any(|e| !w.paired.contains_key(&e.handle)) {
@@ -141,11 +155,13 @@ fn client(w: &mut World) {
     let mut matched = 0;
     for e in &snap {
         if !w.paired.contains_key(&e.handle) {
-            // Pair with our nearest unpaired enemy of the same type.
+            // Pair with our nearest unpaired enemy of the same type; a one-of-a-kind enemy (a boss) at any distance,
+            // since after separate reloads it can stand far from where the host's is.
+            let unique = snap.iter().filter(|o| o.kind == e.kind).count() == 1 && free.iter().filter(|f| f.1 == e.kind).count() == 1;
             let best = free
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| f.1 == e.kind && dist2(f.2, e.pos) < MATCH_DIST * MATCH_DIST)
+                .filter(|(_, f)| f.1 == e.kind && (unique || dist2(f.2, e.pos) < MATCH_DIST * MATCH_DIST))
                 .min_by(|a, b| dist2(a.1.2, e.pos).total_cmp(&dist2(b.1.2, e.pos)))
                 .map(|(i, _)| i);
             let Some(i) = best else { continue };
@@ -163,7 +179,15 @@ fn client(w: &mut World) {
             pos.write(pull(pos.read(), e.pos));
             addr_of_mut!((*b).rotation.y).write(e.yaw);
         }
+        if anim {
+            enemy_anim::hook(b);
+            driven.push(b);
+            if replay(w.anim_seen.insert(e.handle, e.anim_seq), e.anim_seq) {
+                enemy_anim::apply(b, e.anim);
+            }
+        }
     }
+    enemy_anim::set_blocked(driven);
     w.frames += 1;
     if !w.logged || w.frames % 600 == 0 {
         w.logged = true;
@@ -173,6 +197,11 @@ fn client(w: &mut World) {
         snap.iter().filter_map(|e| w.dealt.get(&e.handle).filter(|&&t| t > 0).map(|&total| Damage { handle: e.handle, total })).collect();
     out.truncate(MAX_ENEMIES);
     *state::lock(&LOCAL_DAMAGE) = out;
+}
+
+/// Client: replay the host's last enemy action? Not on first sight (an old call would restart an action midway).
+fn replay(prev_seq: Option<u32>, seq: u32) -> bool {
+    seq != 0 && prev_seq.is_some_and(|p| p != seq)
 }
 
 /// Client, one enemy: the hp to write and the damage our own hits did since last frame. The lower of the host's
@@ -203,6 +232,14 @@ mod tests {
         assert_eq!(merge_hp(100, 80, Some(80)), (80, 0)); // host has not applied it yet: no flicker back to 100
         assert_eq!(merge_hp(60, 80, Some(80)), (60, 0)); // host's own hits come through
         assert_eq!(merge_hp(0, 60, Some(60)), (0, 0)); // host killed it
+    }
+
+    #[test]
+    fn replay_only_new_actions() {
+        assert!(!replay(None, 4)); // first sight
+        assert!(!replay(Some(4), 4)); // same action, sent again
+        assert!(replay(Some(4), 5));
+        assert!(!replay(Some(4), 0)); // host reset: nothing recorded yet
     }
 
     #[test]

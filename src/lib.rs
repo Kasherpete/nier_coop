@@ -74,6 +74,7 @@ fn worker() {
     hooks::ANIM_REPLAY.store(cfg.as_ref().is_some_and(|c| c.anim_replay), std::sync::atomic::Ordering::Relaxed);
     state::LOCKSTEP.store(cfg.as_ref().is_some_and(|c| c.lockstep), std::sync::atomic::Ordering::Relaxed);
     state::WORLD_SYNC.store(cfg.as_ref().is_some_and(|c| c.world_sync), std::sync::atomic::Ordering::Relaxed);
+    state::ENEMY_ANIM.store(cfg.as_ref().is_some_and(|c| c.enemy_anim), std::sync::atomic::Ordering::Relaxed);
     state::HOST.store(cfg.as_ref().is_some_and(|c| c.host), std::sync::atomic::Ordering::Relaxed);
 
     if let Err(e) = hooks::install() {

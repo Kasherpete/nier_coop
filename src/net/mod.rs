@@ -74,6 +74,8 @@ pub struct Config {
     pub world_sync: bool,
     /// `save_sync=true` (both players): the host's newest save slot is copied to the client (see `save.rs`).
     pub save_sync: bool,
+    /// `enemy_anim=true` (both players, with world_sync): the client's enemies play the host's enemies' actions.
+    pub enemy_anim: bool,
 }
 
 /// Reads `key=value` lines from `nier_coop.cfg` next to the game exe
@@ -99,6 +101,7 @@ pub fn load_config() -> Option<Config> {
         host: flag("host"),
         world_sync: flag("world_sync"),
         save_sync: flag("save_sync"),
+        enemy_anim: flag("enemy_anim"),
     })
 }
 
@@ -330,7 +333,7 @@ pub fn encode(h: Header, c: &Correction, frames: &[InputFrame]) -> [u8; PACKET_L
     p
 }
 
-/// World sync packet: magic, seq, count, then at most `MAX_ENEMIES` items (32 * 32 B = 1 KB max).
+/// World sync packet: magic, seq, count, then at most `MAX_ENEMIES` items.
 fn encode_list<T: bytemuck::Pod>(magic: u32, seq: u32, items: &[T]) -> Vec<u8> {
     let items = &items[..items.len().min(MAX_ENEMIES)];
     let mut p = Vec::with_capacity(12 + size_of_val(items));
@@ -584,7 +587,7 @@ mod tests {
 
     #[test]
     fn world_lists_roundtrip_and_reject() {
-        let e = EnemyState { handle: 0x1234_5600, kind: 7, hp: 90, yaw: 1.5, pos: cVec4 { x: 1.0, ..Default::default() } };
+        let e = EnemyState { handle: 0x1234_5600, kind: 7, hp: 90, yaw: 1.5, pos: cVec4 { x: 1.0, ..Default::default() }, anim: [3, 0, 0, 1], anim_seq: 5 };
         let p = encode_list(SNAPSHOT_MAGIC, 9, &[e, e]);
         assert_eq!(decode_list::<EnemyState>(SNAPSHOT_MAGIC, &p), Some((9, vec![e, e])));
         assert_eq!(decode_list::<EnemyState>(DAMAGE_MAGIC, &p), None); // wrong type
@@ -593,7 +596,8 @@ mod tests {
         let mut huge = p.clone();
         huge[8..12].copy_from_slice(&1000u32.to_le_bytes());
         assert_eq!(decode_list::<EnemyState>(SNAPSHOT_MAGIC, &huge), None);
-        assert_eq!(encode_list(SNAPSHOT_MAGIC, 0, &vec![e; 40]).len(), 12 + MAX_ENEMIES * 32); // capped
+        assert_eq!(encode_list(SNAPSHOT_MAGIC, 0, &vec![e; 40]).len(), 12 + MAX_ENEMIES * size_of::<EnemyState>()); // capped
+        assert!(12 + MAX_ENEMIES * size_of::<EnemyState>() <= 1472); // one UDP payload, no fragmentation
         let d = encode_list(DAMAGE_MAGIC, 1, &[Damage { handle: 5, total: 30 }]);
         assert_eq!(decode_list::<Damage>(DAMAGE_MAGIC, &d), Some((1, vec![Damage { handle: 5, total: 30 }])));
         assert_eq!(decode_list::<Damage>(DAMAGE_MAGIC, &encode_list::<Damage>(DAMAGE_MAGIC, 2, &[])), Some((2, vec![])));

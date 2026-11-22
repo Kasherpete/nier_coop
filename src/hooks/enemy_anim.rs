@@ -20,7 +20,10 @@ struct Hooks {
     orig: HashMap<usize, usize>,           // enemy vtable -> its original start_animation
     last: HashMap<usize, ([u32; 4], u32)>, // host: object -> last call args, call count
     blocked: HashSet<usize>,               // client: paired objects whose own AI may not start animations
+    known: HashSet<(usize, [u32; 4])>,     // (vtable, args) this game's own enemies called: the replay allowlist
 }
+/// Allowlist cap, so a long session cannot grow it without bound.
+const MAX_KNOWN: usize = 8192;
 static HOOKS: Mutex<Option<Hooks>> = Mutex::new(None);
 /// Client: the object whose host call is being replayed (let through the block).
 static APPLYING: AtomicUsize = AtomicUsize::new(0);
@@ -59,6 +62,9 @@ unsafe extern "system" fn on_start(this: *mut Pl0000, a: u32, v: u32, a3: u32, a
         let mut g = crate::state::lock(&HOOKS);
         let Some(h) = g.as_mut() else { return };
         let Some(&f) = h.orig.get(&vt) else { return }; // only reached through a vtable patched above
+        if APPLYING.load(Relaxed) != p && h.known.len() < MAX_KNOWN {
+            h.known.insert((vt, [a, v, a3, a4])); // also the calls blocked below: our own AI asked for them
+        }
         if h.blocked.contains(&p) && APPLYING.load(Relaxed) != p {
             return; // client: the host's enemy decides
         }
@@ -74,10 +80,13 @@ pub fn last(b: *mut Pl0000) -> ([u32; 4], u32) {
     crate::state::lock(&HOOKS).as_ref().and_then(|h| h.last.get(&(b as usize)).copied()).unwrap_or_default()
 }
 
-/// Client: replays one host call on our paired enemy.
-pub fn apply(b: *mut Pl0000, [a, v, a3, a4]: [u32; 4]) {
-    let hooked = crate::state::lock(&HOOKS).as_ref().is_some_and(|h| unsafe { b.as_ref() }.is_some_and(|o| h.orig.contains_key(&(o.vtable as usize))));
-    if !hooked {
+/// Client: replays one host call on our paired enemy. Trust boundary: the args come from the peer and go into a
+/// native game function, so only calls this class has made in our own game are replayed (others could crash it).
+pub fn apply(b: *mut Pl0000, args: [u32; 4]) {
+    let [a, v, a3, a4] = args;
+    let Some(vt) = (unsafe { b.as_ref() }).map(|o| o.vtable as usize) else { return };
+    let ok = crate::state::lock(&HOOKS).as_ref().is_some_and(|h| h.orig.contains_key(&vt) && h.known.contains(&(vt, args)));
+    if !ok {
         return;
     }
     APPLYING.store(b as usize, Relaxed);

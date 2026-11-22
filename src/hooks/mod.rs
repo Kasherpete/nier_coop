@@ -55,24 +55,60 @@ static HELD_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `held_thun
 static FREE_AIM_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `free_aim_thunk`'s jmps
 static FREE_AIM_RESUME: AtomicUsize = AtomicUsize::new(0);
 static POD_PROGRAM_FN: AtomicUsize = AtomicUsize::new(0);
+static WARP_FN: AtomicUsize = AtomicUsize::new(0); // `Pl0000::warp`; 0 = not found, snaps write `position` only
 /// Set from `nier_coop.cfg` before `install`.
 pub static SPAWN_2B: AtomicBool = AtomicBool::new(false);
 /// Handle of the spawned 2B (0 = none yet); she is spawned again once the game removes her (restart, area load).
 static SPAWNED: AtomicU32 = AtomicU32::new(0);
 /// Ticks until the next spawn attempt, so a failing spawn is not retried every frame.
 static SPAWN_WAIT: AtomicU32 = AtomicU32::new(0);
-/// Frames the peer's health has been 0; u32::MAX until the peer is seen alive (and again after each follow-death).
+/// Frames the peer's health has been 0 while ours was not; u32::MAX (disarmed) until the peer is seen alive, and
+/// again after each follow-death and whenever the local player dies or unloads.
 static PEER_DEAD_FRAMES: AtomicU32 = AtomicU32::new(u32::MAX);
 const PEER_DEAD_HOLD: u32 = 120; // ~2 s at 0 hp: a real death, not a 1-frame revive
 /// Local player present with health > 0 last tick; its edges reset world sync and bring the spawned 2B back.
 static LOCAL_ALIVE: AtomicBool = AtomicBool::new(false);
 
-/// Next `PEER_DEAD_FRAMES` value for the peer's current health.
-fn peer_dead_step(frames: u32, hp: u32) -> u32 {
-    match (hp, frames) {
-        (1.., _) => 0,
-        (0, u32::MAX) => u32::MAX,
-        (0, n) => n + 1,
+/// Next `PEER_DEAD_FRAMES` value for the peer's current health. While we are dead or loading ourselves we reload
+/// anyway, so it disarms: the peer's 0 hp (its own death, or a stale value sent while it loads) must not kill the
+/// player again right after the respawn.
+fn peer_dead_step(frames: u32, hp: u32, local_alive: bool) -> u32 {
+    match (local_alive, hp, frames) {
+        (false, _, _) => u32::MAX,
+        (true, 1.., _) => 0,
+        (true, 0, u32::MAX) => u32::MAX,
+        (true, 0, n) => n + 1,
+    }
+}
+
+/// Kills the local player the way a kill area does (see `sdk::ANIM_DEATH`), so the game plays the death and
+/// reloads the last checkpoint. Only for a player still alive; dying twice would restart the death.
+fn kill_local(pl: *mut Pl0000) {
+    unsafe {
+        if addr_of_mut!((*pl).health).read() == 0 || addr_of_mut!((*pl).life).read() == 0 {
+            return;
+        }
+        addr_of_mut!((*pl).life).write(0);
+        addr_of_mut!((*pl).health).write(0);
+        if StartAnim.is_enabled() {
+            StartAnim.call(pl, sdk::ANIM_DEATH, 0, 0, 1);
+            return;
+        }
+        let slot = (*pl).vtable.add(sdk::START_ANIMATION_INDEX);
+        if in_module(slot as usize) && in_module(slot.read()) {
+            std::mem::transmute::<usize, unsafe extern "system" fn(*mut Pl0000, u32, u32, u32, u32)>(slot.read())(pl, sdk::ANIM_DEATH, 0, 0, 1);
+        }
+    }
+}
+
+/// Moves `b` to `pos` facing `rot` with the engine's warp, so its collision comes along; plain write without it.
+fn teleport(b: *mut Pl0000, pos: cVec4, rot: cVec4) {
+    match WARP_FN.load(Relaxed) {
+        0 => unsafe { addr_of_mut!((*b).position).write(pos) },
+        f => unsafe {
+            type Warp = unsafe extern "system" fn(*mut Pl0000, *const cVec4, *const cVec4, u32, f32);
+            std::mem::transmute::<usize, Warp>(f)(b, &pos, &rot, 0, 0.0)
+        },
     }
 }
 
@@ -117,6 +153,10 @@ pub fn install() -> Result<(), String> {
     match scan::parse(patterns::POD_PROGRAM).and_then(|p| scan::find_unique(m, &p)) {
         Some(at) => POD_PROGRAM_FN.store(base + at, Relaxed),
         None => tracing::error!("POD_PROGRAM not found; the remote's pod skill stays off"),
+    }
+    match scan::parse(patterns::WARP).and_then(|p| scan::find_unique(m, &p)) {
+        Some(at) => WARP_FN.store(base + at, Relaxed),
+        None => tracing::error!("WARP not found; the partner is snapped by writing her position (may not stick far away)"),
     }
     if crate::state::WORLD_SYNC.load(Relaxed) {
         if let Err(e) = events::install(m, base) {
@@ -370,8 +410,10 @@ extern "system" fn on_tick() {
         if alive {
             SPAWN_WAIT.store(0, Relaxed);
             if let (Some(b), Some(p)) = (spawned, pl) {
-                unsafe { addr_of_mut!((*b).position).write(addr_of_mut!((*p).position).read()) };
+                unsafe { teleport(b, addr_of_mut!((*p).position).read(), addr_of_mut!((*p).rotation).read()) };
             }
+        } else {
+            PEER_DEAD_FRAMES.store(u32::MAX, Relaxed);
         }
     }
     LOCAL_READY.store(pl.is_some(), Relaxed);
@@ -383,10 +425,10 @@ extern "system" fn on_tick() {
     hook_start_animation(pl);
     // The peer died: its game reloads the last checkpoint, so die too and reload the same one (else the two worlds split).
     if let (Some(c), true) = (*state::lock(&REMOTE_CORRECTION), REMOTE_ACTIVE.load(Relaxed)) {
-        let n = peer_dead_step(PEER_DEAD_FRAMES.load(Relaxed), c.hp);
+        let n = peer_dead_step(PEER_DEAD_FRAMES.load(Relaxed), c.hp, alive);
         if n == PEER_DEAD_HOLD {
-            tracing::info!("partner died: killing the local player to restart at the same checkpoint");
-            unsafe { addr_of_mut!((*pl).health).write(0) };
+            tracing::info!("partner died: killing the local player to restart at the last checkpoint");
+            kill_local(pl);
         }
         PEER_DEAD_FRAMES.store(if n >= PEER_DEAD_HOLD { u32::MAX } else { n }, Relaxed);
     }
@@ -686,7 +728,7 @@ fn correct_drift(b: *mut Pl0000, c: &Correction) {
         };
         if d > SNAP_DIST || stuck > STUCK_FRAMES {
             STUCK.store(0, Relaxed);
-            pos.write(t);
+            teleport(b, t, c.rot);
             // Snaps every frame mean the game ignores her position (she stands frozen on screen).
             if SNAPS.fetch_add(1, Relaxed) % 120 == 0 {
                 tracing::info!("partner snapped {d:.1} m to ({:.1}, {:.1}, {:.1}), now at {:?}", t.x, t.y, t.z, pos.read().x);
@@ -703,7 +745,7 @@ fn correct_drift(b: *mut Pl0000, c: &Correction) {
             return;
         }
         let [a, ..] = c.anim;
-        let replay = !sdk::ANIM_CRASHES.contains(&a) && !sdk::ANIM_FROM_INPUT.contains(&a);
+        let replay = !sdk::ANIM_CRASHES.contains(&a) && !sdk::ANIM_FROM_INPUT.contains(&a) && a != sdk::ANIM_DEATH;
         if c.anim_seq != APPLIED_ANIM_SEQ.swap(c.anim_seq, Relaxed) && replay && StartAnim.is_enabled() {
             let [a, v, a3, a4] = c.anim;
             tracing::debug!("anim replay on buddy: {a:#x} {v:#x} {a3:#x} {a4:#x}");
@@ -722,12 +764,23 @@ fn yaw_error(a: f32, b: f32) -> f32 {
 pub(crate) mod tests {
     #[test]
     fn peer_dead_needs_alive_first() {
-        use super::peer_dead_step as s;
+        let s = |frames, hp| super::peer_dead_step(frames, hp, true);
         assert_eq!(s(u32::MAX, 0), u32::MAX); // never seen alive (not in game yet): stay disarmed
         assert_eq!(s(u32::MAX, 50), 0);
         assert_eq!(s(0, 0), 1);
         assert_eq!(s(7, 0), 8);
         assert_eq!(s(7, 1), 0); // revived: count restarts
+    }
+
+    #[test]
+    fn peer_dead_disarms_while_local_dead() {
+        use super::peer_dead_step as s;
+        // We died first: the peer then dies too (following us), which must not count against our respawn.
+        assert_eq!(s(50, 0, false), u32::MAX);
+        assert_eq!(s(50, 80, false), u32::MAX);
+        // Respawned while the peer still loads (its last packet said 0 hp): stays disarmed until it is seen alive.
+        assert_eq!(s(u32::MAX, 0, true), u32::MAX);
+        assert_eq!(s(u32::MAX, 80, true), 0);
     }
 
     #[test]
@@ -767,6 +820,11 @@ pub(crate) mod tests {
         assert_eq!((site, resume), (0x48b943, 0x48b992));
         let pp = crate::scan::parse(crate::sdk::patterns::POD_PROGRAM).and_then(|p| crate::scan::find_unique(&img, &p));
         assert_eq!(pp, Some(0x529080));
+        let warp = crate::scan::parse(crate::sdk::patterns::WARP).and_then(|p| crate::scan::find_unique(&img, &p));
+        assert_eq!(warp, Some(0x4f0fa0));
+        // The kill-area death this mod copies: `mov [r12+0x10668],esi; mov [r12+0x858],esi; ...; lea edx,[r9+0x35]`.
+        assert_eq!(&img[0x47b172..0x47b182], &[0x41, 0x89, 0xB4, 0x24, 0x68, 0x06, 0x01, 0x00, 0x41, 0x89, 0xB4, 0x24, 0x58, 0x08, 0x00, 0x00]);
+        assert_eq!(&img[0x47b191..0x47b195], &[0x41, 0x8D, 0x51, crate::sdk::ANIM_DEATH as u8]);
     }
 }
 

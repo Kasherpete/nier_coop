@@ -42,7 +42,9 @@ pub struct Pl0000 {
     pub facing2: f32,          // 0x0143C CharacterController::facing (@0x79C), stick direction
     _pad_01440: [u8; 0xEF24],  // 0x01440
     pub muteki_timer: f32,     // 0x10364 invincible while > 0; script Pl0000.setEventMuteki sets 300.0
-    _pad_10368: [u8; 0x2498],  // 0x10368 (0x10B64: vtable +0x350's player-controlled flag, 0 for the remote)
+    _pad_10368: [u8; 0x300],   // 0x10368
+    pub life: u32,             // 0x10668 the real health: damage (0x4fe150) subtracts here, the update copies it to `health` each frame
+    _pad_1066c: [u8; 0x2194],  // 0x1066C (0x10B64: vtable +0x350's player-controlled flag, 0 for the remote)
     pub pod_aim: cVec4,        // 0x12800 world point pod_shot aims at (camera ray for the player, pod_target for others)
     _pad_12810: [u8; 0x3C6C],  // 0x12810
     pub buddy_handle: u32,     // 0x1647C
@@ -66,6 +68,7 @@ const _: () = {
     assert!(offset_of!(Pl0000, speed) == 0x1434);
     assert!(offset_of!(Pl0000, facing2) == 0x143C);
     assert!(offset_of!(Pl0000, muteki_timer) == 0x10364);
+    assert!(offset_of!(Pl0000, life) == 0x10668);
     assert!(offset_of!(Pl0000, pod_aim) == 0x12800);
     assert!(offset_of!(Pl0000, buddy_handle) == 0x1647C);
     assert!(offset_of!(Pl0000, pod_target) == 0x164DC);
@@ -95,6 +98,10 @@ pub const ANIM_FROM_INPUT: [u32; 2] = [16, 18];
 /// Animation the spawned partner's AI starts every idle frame (seen in-game). While in it, its pod never spawns
 /// shots, so the remote's own calls with it are dropped and it stays in idle (0) like the player it mirrors.
 pub const ANIM_PARTNER_WAIT: u32 = 1_000_000;
+/// Death state. A kill area does `life = health = 0; start_animation(ANIM_DEATH, 0, 0, 1)` (exe 2026-10-09:
+/// 0x47b172, in the per-frame damage update 0x47af40, which returns early once health is 0, so writing 0 alone
+/// never kills). Never replayed on the partner: her death would fail the mission.
+pub const ANIM_DEATH: u32 = 0x35;
 
 /// Transform passed to the spawn function.
 #[repr(C)]
@@ -292,6 +299,10 @@ pub mod patterns {
     /// `HapGoalLocationAction` vtable slot `finish(this)`: removes its map marker and HUD objective, then requests
     /// DONE (exe 2026-10-09: 0x3e07f0).
     pub const GOAL_FINISH: usize = 12;
+    /// Start of `Pl0000::warp(this, &pos, &rot, 0, 0.0)` (exe 2026-10-09: 0x4f0fa0), the engine's teleport (used
+    /// to bring the buddy to the player): besides `position` it moves the previous positions (0x17890, 0x178A0)
+    /// and the collision body, so the character stays there. Writing `position` alone does not survive long jumps.
+    pub const WARP: &str = "48 8B C4 55 56 57 41 54 41 55 48 8D 68 A9 48 81 EC A0 00 00 00 81 B9 70 06 00 00 D3 00 00 00";
     /// First bytes at `aim_copy`: `lea rcx,[rdi+0x12800]`.
     pub const AIM_COPY: [u8; 7] = [0x48, 0x8D, 0x8F, 0x00, 0x28, 0x01, 0x00];
 }

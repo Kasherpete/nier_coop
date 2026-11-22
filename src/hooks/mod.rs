@@ -49,7 +49,22 @@ pub static ANIM_REPLAY: AtomicBool = AtomicBool::new(false);
 /// Local tick counter stamped on each sent input frame (never 0, which marks an empty packet slot).
 static FRAME: AtomicU32 = AtomicU32::new(0);
 /// The remote input applied this tick; read again by the held and free-aim hooks later in the frame.
-static APPLIED: Mutex<InputFrame> = Mutex::new(InputFrame { frame: 0, speed: 0.0, facing2: 0.0, held: 0, buttons: [0; 8], aim: cVec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 }, checksum: 0, _pad: 0 });
+static APPLIED: Mutex<InputFrame> = Mutex::new(InputFrame {
+    frame: 0,
+    speed: 0.0,
+    facing2: 0.0,
+    held: 0,
+    buttons: [0; 8],
+    aim: cVec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 },
+    checksum: 0,
+    _pad: 0,
+    pos: cVec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 },
+});
+/// Ticks in a row with no remote input to apply (peer paused, hacking, loading, lag).
+static NO_INPUT: AtomicU32 = AtomicU32::new(0);
+/// After this many ticks without input the partner lets go of the stick, or she keeps running in the last
+/// direction (the peer's position no longer corrects her while it has no character).
+const IDLE_AFTER: u32 = 30;
 /// held_flags the mid-hook writes into the remote's controller.
 static REMOTE_HELD: AtomicU32 = AtomicU32::new(0);
 static HELD_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0); // read by `held_thunk`'s jmp
@@ -74,6 +89,10 @@ static LOCAL_ALIVE: AtomicBool = AtomicBool::new(false);
 /// at the boss start).
 static REJOIN_HOST: AtomicBool = AtomicBool::new(false);
 const REJOIN_DIST: f32 = 30.0; // m; closer than this both reloaded the same checkpoint
+/// The local player went away alive (hacking, flight unit, area load), as opposed to dying.
+static AWAY_ALIVE: AtomicBool = AtomicBool::new(false);
+/// The peer died while we were away: once our character is back, join it (follow the death, or its checkpoint).
+static FOLLOW_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Next `PEER_DEAD_FRAMES` value for the peer's current health. While we are dead or loading ourselves we reload
 /// anyway, so it disarms: the peer's 0 hp (its own death, or a stale value sent while it loads) must not kill the
@@ -418,15 +437,46 @@ extern "system" fn on_tick() {
             if let (Some(b), Some(p)) = (spawned, pl) {
                 unsafe { teleport(b, addr_of_mut!((*p).position).read(), addr_of_mut!((*p).rotation).read()) };
             }
+            if let (true, Some(p)) = (FOLLOW_PENDING.swap(false, Relaxed), pl) {
+                // Still dead or loading there: die too, so both reload the same checkpoint. Already back: join it
+                // where it respawned instead (dying now would make it follow us and reload a second time).
+                match *state::lock(&REMOTE_CORRECTION) {
+                    Some(c) if c.hp > 0 => {
+                        tracing::info!("partner died while you were away and has respawned: warping to it");
+                        teleport(p, c.pos, c.rot);
+                    }
+                    _ => {
+                        tracing::info!("partner died while you were away: following it to the last checkpoint");
+                        kill_local(p);
+                    }
+                }
+            }
         } else {
             PEER_DEAD_FRAMES.store(u32::MAX, Relaxed);
             REJOIN_HOST.store(pl.is_some() && !HOST.load(Relaxed), Relaxed);
+            AWAY_ALIVE.store(pl.is_none(), Relaxed); // gone with health > 0 last tick: not a death
         }
     }
     LOCAL_READY.store(pl.is_some(), Relaxed);
     let ls_frame = if LOCKSTEP.load(Relaxed) { lockstep::step_clock(pl.is_some()) } else { None };
     let Some(pl) = pl else {
         BUDDY.store(0, Relaxed);
+        {
+            // No character here (loading, hacking, flight unit): nothing for the peer to correct toward, and no
+            // health to show. A dead player stays reported dead through the reload, so the peer still follows.
+            let mut c = state::lock(&LOCAL_CORRECTION);
+            if c.is_some_and(|c| c.hp > 0) {
+                *c = None;
+            }
+        }
+        // The peer may die while we are away; its death is followed once our character is back.
+        if let (Some(c), true, true) = (*state::lock(&REMOTE_CORRECTION), REMOTE_ACTIVE.load(Relaxed), AWAY_ALIVE.load(Relaxed)) {
+            let n = peer_dead_step(PEER_DEAD_FRAMES.load(Relaxed), c.hp, true);
+            if n == PEER_DEAD_HOLD && !FOLLOW_PENDING.swap(true, Relaxed) {
+                tracing::info!("partner died while you were away (hacking, flight unit, loading): following once you are back");
+            }
+            PEER_DEAD_FRAMES.store(if n >= PEER_DEAD_HOLD { u32::MAX } else { n }, Relaxed);
+        }
         return;
     };
     hook_start_animation(pl);
@@ -498,6 +548,7 @@ extern "system" fn on_tick() {
             aim: addr_of_mut!((*pl).pod_aim).read(),
             checksum,
             _pad: 0,
+            pos: addr_of_mut!((*pl).position).read(),
         };
         if frame != 0 {
             let mut local = state::lock(&LOCAL_INPUTS);
@@ -529,14 +580,27 @@ extern "system" fn on_tick() {
             Some(r) => r,
             None => state::lock(&REMOTE_INPUTS).pop(),
         };
+        let fresh = next.is_some();
         let input = {
             let mut applied = state::lock(&APPLIED);
-            *applied = next.unwrap_or(InputFrame { buttons: [0; 8], ..*applied });
+            *applied = match next {
+                Some(f) => {
+                    NO_INPUT.store(0, Relaxed);
+                    f
+                }
+                None if NO_INPUT.fetch_add(1, Relaxed) + 1 >= IDLE_AFTER => {
+                    InputFrame { buttons: [0; 8], speed: 0.0, held: 0, ..*applied }
+                }
+                None => InputFrame { buttons: [0; 8], ..*applied },
+            };
             *applied
         };
         apply_input(b, &input);
         if let Some(c) = *state::lock(&REMOTE_CORRECTION) {
-            correct_drift(b, &c);
+            // Where the peer stood on the frame just applied; the newest position would run ahead of her by the
+            // input buffer and pull against her own motion.
+            let at = Some(input.pos).filter(|p| fresh && *p != cVec4::default());
+            correct_drift(b, &c, at);
             run_pod_program(b, c.pod_cooldown);
         }
     }
@@ -730,11 +794,12 @@ static SNAPS: AtomicU32 = AtomicU32::new(0);
 /// Past this yaw error (rad) her rotation is set to the peer's.
 const CORRECT_YAW: f32 = 0.5;
 
-/// Drift correction only: small errors are left to the inputs, so her motion stays the engine's own.
-fn correct_drift(b: *mut Pl0000, c: &Correction) {
+/// Drift correction only: small errors are left to the inputs, so her motion stays the engine's own. `at` is the
+/// peer's position on the input frame applied this tick (None: no new frame, use its newest position).
+fn correct_drift(b: *mut Pl0000, c: &Correction, at: Option<cVec4>) {
     unsafe {
         let pos = addr_of_mut!((*b).position);
-        let (p, t) = (pos.read(), c.pos);
+        let (p, t) = (pos.read(), at.unwrap_or(c.pos));
         let d = ((t.x - p.x).powi(2) + (t.y - p.y).powi(2) + (t.z - p.z).powi(2)).sqrt();
         let stuck = if d > STUCK_DIST {
             STUCK.fetch_add(1, Relaxed) + 1

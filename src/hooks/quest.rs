@@ -2,7 +2,7 @@
 //! "Route/A", ...: the story and quest progress the save keeps under SceneState) are copied to the client through
 //! the game's own SceneStateSystem.set / .reset, the functions its scripts call. Game thread only.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -74,11 +74,41 @@ pub fn tick() {
             tracing::info!("quest sync: + {n}");
         }
     }
-    for n in del {
+    let mut missing = state::lock(&MISSING);
+    let partial = theirs.len() * 2 < ours.len();
+    if partial && !del.is_empty() {
+        tracing::debug!("quest sync: host list has {} states, ours {}; not resetting from it", theirs.len(), ours.len());
+    }
+    for n in debounce(missing.get_or_insert_with(Default::default), &del, partial) {
         if call(a, a.reset, n) {
             tracing::info!("quest sync: - {n}");
         }
     }
+}
+
+/// Lists in a row a state must be missing on the host before it is reset here.
+const RESET_AFTER: u32 = 3;
+/// Per state we have and the host lacks: host lists in a row without it.
+static MISSING: std::sync::Mutex<Option<HashMap<String, u32>>> = std::sync::Mutex::new(None);
+
+/// The states to reset now: missing from the host's list `RESET_AFTER` times in a row. A state is set here a
+/// moment before the host's next list shows it (a cutscene the client played), and a host list taken mid-load
+/// can be short; resetting from one list made such states flap. A `partial` list counts toward nothing.
+fn debounce<'a>(missing: &mut HashMap<String, u32>, del: &[&'a str], partial: bool) -> Vec<&'a str> {
+    missing.retain(|n, _| del.contains(&n.as_str()));
+    if partial {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &n in del {
+        let c = missing.entry(n.to_string()).or_insert(0);
+        *c += 1;
+        if *c >= RESET_AFTER {
+            missing.remove(n);
+            out.push(n);
+        }
+    }
+    out
 }
 
 /// Shared states the host has and we lack (to set), and that we have and the host does not (to reset).
@@ -162,6 +192,17 @@ mod tests {
         let theirs = ["q120/DONE", "Buddy/Auto", "Route/A", "DLC_installed"];
         assert_eq!(diff(&ours, &theirs), (vec!["q120/DONE"], vec!["q120/RUN_1"]));
         assert!(valid("q770_FIN") && !valid("") && !valid("a b") && !valid(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn resets_only_after_repeated_absence() {
+        let mut m = HashMap::new();
+        assert!(debounce(&mut m, &["q1", "q2"], false).is_empty());
+        assert!(debounce(&mut m, &["q1"], false).is_empty()); // q2 came back on the host: its count restarts
+        assert!(debounce(&mut m, &["q1", "q2"], true).is_empty()); // short host list: counts nothing
+        assert_eq!(debounce(&mut m, &["q1", "q2"], false), vec!["q1"]); // third full list in a row without q1
+        assert!(debounce(&mut m, &["q2"], false).is_empty());
+        assert_eq!(debounce(&mut m, &["q2"], false), vec!["q2"]);
     }
 
     /// `NIER_EXE=<exe> cargo test quest -- --ignored --nocapture`; offsets from the exe of 2026-11-19.

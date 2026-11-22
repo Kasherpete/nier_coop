@@ -21,8 +21,9 @@ pub struct InputFrame {
     pub aim: cVec4,        // 0x30 pod aim point (Pl0000::pod_aim)
     pub checksum: u32,     // 0x40 lockstep: hash of world entities at the start of this frame (0 outside lockstep)
     pub _pad: u32,         // 0x44
+    pub pos: cVec4,        // 0x48 sender's position on this frame: drift is measured against the frame being applied
 }
-const _: () = assert!(size_of::<InputFrame>() == 0x48);
+const _: () = assert!(size_of::<InputFrame>() == 0x58);
 
 /// Sender's actual state, used only to correct drift the inputs did not reproduce.
 #[repr(C)]
@@ -132,15 +133,25 @@ pub static REMOTE_EPOCH: AtomicU32 = AtomicU32::new(0);
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Pod, Zeroable)]
 pub struct EnemyState {
-    pub handle: u32, // 0x00 entity handle (assumed equal in both games: same area, same load order)
-    pub kind: u32,   // 0x04 FNV-1a of the entity name, so a handle that means another entity is skipped
+    pub handle: u32, // 0x00 the host's entity handle (each game numbers its own objects; the client pairs by type and distance)
+    pub kind: u32,   // 0x04 Entity::object_id (type id 0x2xxxx), the client pairs only enemies of the same type
     pub hp: u32,     // 0x08 BehaviorAppBase::health
     pub yaw: f32,    // 0x0C rotation.y
     pub pos: cVec4,  // 0x10
     pub anim: [u32; 4], // 0x20 last start_animation args (`enemy_anim=true`)
     pub anim_seq: u32,  // 0x30 start_animation calls so far; a change means a new action to replay
+    pub applied: u32,   // 0x34 client damage the host has applied to it (for `WorldGen::client`): the client's ack
 }
-const _: () = assert!(size_of::<EnemyState>() == 0x34);
+const _: () = assert!(size_of::<EnemyState>() == 0x38);
+
+/// Generations of the two world-sync sessions, sent with every snapshot and damage list. Each side starts a new
+/// generation whenever it forgets its pairings and totals (death, respawn, hacking, peer timeout), so the other
+/// side never applies totals counted against a world that is gone.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct WorldGen {
+    pub host: u32,   // host's world generation
+    pub client: u32, // client's damage-total generation (in a snapshot: the one `applied` belongs to)
+}
 
 /// Total damage the client has dealt to one enemy (cumulative, so a lost packet loses nothing).
 #[repr(C)]
@@ -152,17 +163,17 @@ pub struct Damage {
 const _: () = assert!(size_of::<Damage>() == 0x8);
 
 /// Enemies per snapshot (the ones nearest the client), and damage entries per packet.
-/// 24 * 52 B + 12 keeps a snapshot inside one 1472 B UDP payload (no IP fragmentation).
+/// 24 * 56 B + 20 B header keeps a snapshot inside one 1472 B UDP payload (no IP fragmentation).
 pub const MAX_ENEMIES: usize = 24;
 pub static WORLD_SYNC: AtomicBool = AtomicBool::new(false);
 /// `enemy_anim=true`: with world sync, the host's enemies also decide every action (see `hooks/enemy_anim.rs`).
 pub static ENEMY_ANIM: AtomicBool = AtomicBool::new(false);
 /// Host: this frame's snapshot (game thread writes, net sends). Client: newest snapshot received and when.
-pub static LOCAL_WORLD: Mutex<Vec<EnemyState>> = Mutex::new(Vec::new());
-pub static REMOTE_WORLD: Mutex<Option<(std::time::Instant, Vec<EnemyState>)>> = Mutex::new(None);
+pub static LOCAL_WORLD: Mutex<(WorldGen, Vec<EnemyState>)> = Mutex::new((WorldGen { host: 0, client: 0 }, Vec::new()));
+pub static REMOTE_WORLD: Mutex<Option<(std::time::Instant, WorldGen, Vec<EnemyState>)>> = Mutex::new(None);
 /// Client: damage totals to send. Host: newest totals received.
-pub static LOCAL_DAMAGE: Mutex<Vec<Damage>> = Mutex::new(Vec::new());
-pub static REMOTE_DAMAGE: Mutex<Vec<Damage>> = Mutex::new(Vec::new());
+pub static LOCAL_DAMAGE: Mutex<(WorldGen, Vec<Damage>)> = Mutex::new((WorldGen { host: 0, client: 0 }, Vec::new()));
+pub static REMOTE_DAMAGE: Mutex<Option<(WorldGen, Vec<Damage>)>> = Mutex::new(None);
 
 /// Quest sync: the host's scene state names, newline-separated (game thread writes, net sends every second).
 /// Client: the newest list received, taken by the game thread when applied.
